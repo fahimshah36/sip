@@ -111,6 +111,10 @@ def status():
     print(f"Status: {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
     return "", 200
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
+
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
