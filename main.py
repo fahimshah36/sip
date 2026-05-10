@@ -127,6 +127,6 @@ def status():
     print(f"Status: {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
     return "", 200
 
-# if _name_ == "_main_":
-print("Server starting on http://0.0.0.0:5000")
-app.run(debug=True, host="0.0.0.0", port=5000)
+if __name__ == "__main__":
+    print("Server starting on http://0.0.0.0:5000")
+    app.run(debug=True, host="0.0.0.0", port=5000)
