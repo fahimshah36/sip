@@ -114,6 +114,11 @@ async def status(req: Request):
     print(f"Status: {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
     return Response(content="", status_code=200)
 
+@app.get("/call-status/{call_sid}")
+async def call_status(call_sid: str):
+    call = client.calls(call_sid).fetch()
+    return {"status": call.status}
+
 
 # ─────────────────────────────
 # HEALTH CHECK
