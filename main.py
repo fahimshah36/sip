@@ -51,7 +51,7 @@ async def voice(req: Request):
     to = form.get("To", "")
     print(f"/voice triggered → dialing {to}")
     response = VoiceResponse()
-    dial = response.dial(caller_id=TWILIO_NUMBER)
+    dial = response.dial(caller_id=TWILIO_NUMBER, answer_on_bridge=True)
     dial.number(to, url=f"{BASE_URL}/connected")
     return Response(content=str(response), media_type="text/xml")  # use Response not JSONResponse
 
