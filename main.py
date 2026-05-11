@@ -1,13 +1,13 @@
 import os
 import asyncio
+from collections import defaultdict
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
-from fastapi.responses import JSONResponse, Response
-
 
 app = FastAPI()
 
@@ -28,6 +28,9 @@ BASE_URL      = os.environ["BASE_URL"]
 
 client = Client(ACCOUNT_SID, AUTH_TOKEN)
 
+# In-memory queues for real-time call status push via SSE
+call_status_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+
 
 # ─────────────────────────────
 # TOKEN
@@ -46,15 +49,39 @@ def token():
 
 
 # ─────────────────────────────
-# VOICE — dials the phone, waits for answer
-# answerOnBridge=True means SDK accept fires only
-# when the callee actually picks up
+# MAKE CALL (kept for reference, not used by browser SDK flow)
+# ─────────────────────────────
+@app.post("/make-call")
+async def make_call(req: Request):
+    body = await req.json()
+    to = body.get("to")
+    print(f"Calling {to}...")
+    call = client.calls.create(
+        to=to,
+        from_=TWILIO_NUMBER,
+        url=f"{BASE_URL}/voice",
+        status_callback=f"{BASE_URL}/status",
+        status_callback_method="POST",
+        status_callback_event=["initiated", "ringing", "answered", "completed"],
+    )
+    print(f"Call SID: {call.sid}")
+    return {"call_sid": call.sid, "status": call.status}
+
+
+# ─────────────────────────────
+# VOICE — dials the phone
 # ─────────────────────────────
 @app.post("/voice")
 async def voice(req: Request):
     form = await req.form()
     to = form.get("To", "")
-    print(f"/voice triggered → dialing {to}")
+    parent_sid = form.get("CallSid", "")
+    print(f"/voice triggered → dialing {to} | parent SID: {parent_sid}")
+
+    # Initialize SSE queue for this call
+    if parent_sid:
+        call_status_queues[parent_sid]  # initialize queue
+
     response = VoiceResponse()
     dial = response.dial(
         caller_id=TWILIO_NUMBER,
@@ -62,8 +89,61 @@ async def voice(req: Request):
         action=f"{BASE_URL}/dial-complete",
         method="POST",
     )
-    dial.number(to)  # NO url= here
+    dial.number(
+        to,
+        status_callback=f"{BASE_URL}/child-status",
+        status_callback_method="POST",
+        status_callback_event=["initiated", "ringing", "answered", "completed"],
+    )
     return Response(content=str(response), media_type="text/xml")
+
+
+# ─────────────────────────────
+# CHILD CALL STATUS — phone leg events
+# Twilio POSTs here when the phone rings/answers/hangs up
+# ─────────────────────────────
+@app.post("/child-status")
+async def child_status(req: Request):
+    form = await req.form()
+    call_status = form.get("CallStatus", "")
+    child_sid   = form.get("CallSid", "")
+    parent_sid  = form.get("ParentCallSid", "")
+    print(f"[child-status] {call_status.upper()} | child: {child_sid} | parent: {parent_sid}")
+
+    if parent_sid and parent_sid in call_status_queues:
+        await call_status_queues[parent_sid].put(call_status)
+
+    return Response(content="", status_code=200)
+
+
+# ─────────────────────────────
+# SSE — browser subscribes to real-time call events
+# ─────────────────────────────
+@app.get("/call-events/{call_sid}")
+async def call_events(call_sid: str):
+    queue = call_status_queues[call_sid]
+
+    async def stream():
+        try:
+            while True:
+                try:
+                    status = await asyncio.wait_for(queue.get(), timeout=25)
+                    yield f"data: {status}\n\n"
+                    if status in ("completed", "failed", "busy", "no-answer", "canceled"):
+                        break
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"  # prevent proxy timeout
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 
 # ─────────────────────────────
@@ -75,35 +155,11 @@ async def dial_complete(req: Request):
     dial_status = form.get("DialCallStatus", "")
     print(f"/dial-complete → DialCallStatus: {dial_status}")
     response = VoiceResponse()
-    response.say("The call has ended. Goodbye.", voice="alice")
     return Response(content=str(response), media_type="text/xml")
 
 
 # ─────────────────────────────
-# DTMF RECEIVER
-# ─────────────────────────────
-@app.post("/dtmf")
-async def dtmf(req: Request):
-    form = await req.form()
-    digit    = form.get("Digits", "")
-    call_sid = form.get("CallSid", "")
-    print(f"DIGIT PRESSED: {digit} | CALL SID: {call_sid}")
-    response = VoiceResponse()
-    response.say(f"You pressed {digit}.", voice="alice")
-    gather = response.gather(
-        input="dtmf",
-        action=f"{BASE_URL}/dtmf",
-        method="POST",
-        num_digits=1,
-        timeout=30,
-        finish_on_key=""
-    )
-    gather.say("Press another key.", voice="alice")
-    return Response(content=str(response), media_type="text/xml")
-
-
-# ─────────────────────────────
-# CALL STATUS
+# PARENT CALL STATUS
 # ─────────────────────────────
 @app.post("/status")
 async def status(req: Request):
@@ -111,13 +167,12 @@ async def status(req: Request):
     call_status = form.get("CallStatus", "")
     call_sid    = form.get("CallSid", "")
     duration    = form.get("CallDuration", "0")
-    print(f"Status: {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
-    return Response(content="", status_code=200)
+    print(f"[parent-status] {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
 
-@app.get("/call-status/{call_sid}")
-async def call_status(call_sid: str):
-    call = client.calls(call_sid).fetch()
-    return {"status": call.status}
+    if call_sid in call_status_queues and call_status in ("completed", "failed"):
+        await call_status_queues[call_sid].put(call_status)
+
+    return Response(content="", status_code=200)
 
 
 # ─────────────────────────────
