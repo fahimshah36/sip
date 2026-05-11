@@ -2,17 +2,16 @@ import os
 import asyncio
 import threading
 import websockets
+import websockets.server
 from flask import Flask, jsonify, request
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
 from flask_cors import CORS
-from flask_sock import Sock
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
-sock = Sock(app)
 
 ACCOUNT_SID   = os.environ["ACCOUNT_SID"]
 AUTH_TOKEN    = os.environ["AUTH_TOKEN"]
@@ -42,62 +41,6 @@ def token():
     )
     access_token.add_grant(voice_grant)
     return jsonify({"token": access_token.to_jwt()})
-
-
-# ─────────────────────────────
-# WEBSOCKET PROXY
-# ─────────────────────────────
-@sock.route("/signal-proxy")
-def signal_proxy(ws):
-    requested = request.headers.get("Sec-WebSocket-Protocol", "")
-    subprotocols = [p.strip() for p in requested.split(",")] if requested else []
-    print(f"[proxy] Browser requested subprotocols: {subprotocols}")
-
-    async def run():
-        try:
-            connect_kwargs = {
-                "extra_headers": {
-                    "User-Agent": "Mozilla/5.0 TwilioProxy/1.0",
-                    "Origin": "https://voice.twilio.com",
-                },
-            }
-            if subprotocols:
-                connect_kwargs["subprotocols"] = subprotocols
-
-            async with websockets.connect(
-                "wss://chunder.twilio.com/signal",
-                **connect_kwargs
-            ) as twilio_ws:
-                print("[proxy] Connected to Twilio successfully")
-
-                async def browser_to_twilio():
-                    while True:
-                        data = ws.receive()
-                        if data is None:
-                            print("[proxy] Browser disconnected")
-                            break
-                        await twilio_ws.send(data)
-
-                async def twilio_to_browser():
-                    async for message in twilio_ws:
-                        ws.send(message)
-
-                await asyncio.gather(
-                    browser_to_twilio(),
-                    twilio_to_browser()
-                )
-        except Exception as e:
-            print(f"[proxy error] {e}")
-
-    loop = asyncio.new_event_loop()
-
-    def run_loop():
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(run())
-
-    t = threading.Thread(target=run_loop)
-    t.start()
-    t.join()
 
 
 # ─────────────────────────────
@@ -184,5 +127,67 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+# ─────────────────────────────
+# WEBSOCKET PROXY SERVER
+# Runs on port 8765 alongside Flask
+# ─────────────────────────────
+async def proxy_handler(browser_ws):
+    # Forward whatever subprotocol the browser requested
+    subprotocols = list(browser_ws.subprotocols) if browser_ws.subprotocols else []
+    print(f"[proxy] New connection, subprotocols: {subprotocols}")
+
+    try:
+        async with websockets.connect(
+            "wss://chunder.twilio.com/signal",
+            subprotocols=subprotocols or None,
+            extra_headers={
+                "Origin": "https://voice.twilio.com",
+                "User-Agent": "Mozilla/5.0 TwilioProxy/1.0",
+            }
+        ) as twilio_ws:
+            print("[proxy] Connected to Twilio ✅")
+
+            async def browser_to_twilio():
+                try:
+                    async for message in browser_ws:
+                        await twilio_ws.send(message)
+                except Exception as e:
+                    print(f"[proxy] browser→twilio error: {e}")
+
+            async def twilio_to_browser():
+                try:
+                    async for message in twilio_ws:
+                        await browser_ws.send(message)
+                except Exception as e:
+                    print(f"[proxy] twilio→browser error: {e}")
+
+            await asyncio.gather(browser_to_twilio(), twilio_to_browser())
+
+    except Exception as e:
+        print(f"[proxy] Connection error: {e}")
+
+
+def start_proxy():
+    port = int(os.environ.get("WS_PORT", 8765))
+    print(f"[proxy] WebSocket proxy starting on port {port}")
+
+    async def serve():
+        async with websockets.serve(
+            proxy_handler,
+            "0.0.0.0",
+            port,
+            subprotocols=["voice"],  # accept voice subprotocol
+        ):
+            print(f"[proxy] Listening on ws://0.0.0.0:{port}")
+            await asyncio.Future()  # run forever
+
+    asyncio.run(serve())
+
+
+# Start proxy in background thread when app loads
+proxy_thread = threading.Thread(target=start_proxy, daemon=True)
+proxy_thread.start()
+
+
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="0.0.0.0", port=5000)
