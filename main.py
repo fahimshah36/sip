@@ -50,31 +50,32 @@ def token():
 # ─────────────────────────────
 @sock.route("/signal-proxy")
 def signal_proxy(ws):
-    async def run():
-        try:
-            async with websockets.connect(
-                "wss://chunder.twilio.com/signal",
-                extra_headers={"User-Agent": "TwilioProxy/1.0"}
-            ) as twilio_ws:
-                async def browser_to_twilio():
-                    while True:
-                        data = ws.receive()
-                        if data is None:
-                            break
-                        await twilio_ws.send(data)
+    import gevent
+    import gevent.socket
+    import ssl
 
-                async def twilio_to_browser():
-                    async for message in twilio_ws:
-                        ws.send(message)
+    context = ssl.create_default_context()
+    raw = gevent.socket.create_connection(("chunder.twilio.com", 443))
+    ssl_sock = context.wrap_socket(raw, server_hostname="chunder.twilio.com")
 
-                await asyncio.gather(
-                    browser_to_twilio(),
-                    twilio_to_browser()
-                )
-        except Exception as e:
-            print(f"[proxy error] {e}")
+    # Simple bidirectional forward
+    def forward_to_twilio():
+        while True:
+            data = ws.receive()
+            if data is None:
+                break
+            ssl_sock.sendall(data.encode() if isinstance(data, str) else data)
 
-    asyncio.run(run())
+    def forward_to_browser():
+        while True:
+            data = ssl_sock.recv(4096)
+            if not data:
+                break
+            ws.send(data)
+
+    t1 = gevent.spawn(forward_to_twilio)
+    t2 = gevent.spawn(forward_to_browser)
+    gevent.joinall([t1, t2])
 
 
 # ─────────────────────────────
