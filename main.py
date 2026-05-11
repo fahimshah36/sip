@@ -8,6 +8,7 @@ from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
+from twilio.twiml.voice_response import Dial, Number
 
 app = FastAPI()
 
@@ -83,18 +84,20 @@ async def voice(req: Request):
         call_status_queues[parent_sid]  # initialize queue
 
     response = VoiceResponse()
-    dial = response.dial(
+    dial = Dial(
         caller_id=TWILIO_NUMBER,
         answer_on_bridge=True,
         action=f"{BASE_URL}/dial-complete",
         method="POST",
     )
-    dial.number(
+    number = Number(
         to,
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
-        status_callback_event=["initiated", "ringing", "answered", "completed"],
+        status_callback_event="initiated ringing answered completed",
     )
+    dial.append(number)
+    response.append(dial)
     return Response(content=str(response), media_type="text/xml")
 
 
