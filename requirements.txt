@@ -2,7 +2,6 @@ flask
 flask-cors
 flask-sock
 twilio
-gunicorn[gevent]
+gunicorn
 python-dotenv
 websockets
-gevent

@@ -1,5 +1,6 @@
 import os
 import asyncio
+import threading
 import websockets
 from flask import Flask, jsonify, request
 from twilio.jwt.access_token import AccessToken
@@ -45,37 +46,58 @@ def token():
 
 # ─────────────────────────────
 # WEBSOCKET PROXY
-# Forwards browser <-> Twilio signaling
-# so BD network block is bypassed
 # ─────────────────────────────
 @sock.route("/signal-proxy")
 def signal_proxy(ws):
-    import gevent
-    import gevent.socket
-    import ssl
+    requested = request.headers.get("Sec-WebSocket-Protocol", "")
+    subprotocols = [p.strip() for p in requested.split(",")] if requested else []
+    print(f"[proxy] Browser requested subprotocols: {subprotocols}")
 
-    context = ssl.create_default_context()
-    raw = gevent.socket.create_connection(("chunder.twilio.com", 443))
-    ssl_sock = context.wrap_socket(raw, server_hostname="chunder.twilio.com")
+    async def run():
+        try:
+            connect_kwargs = {
+                "extra_headers": {
+                    "User-Agent": "Mozilla/5.0 TwilioProxy/1.0",
+                    "Origin": "https://voice.twilio.com",
+                },
+            }
+            if subprotocols:
+                connect_kwargs["subprotocols"] = subprotocols
 
-    # Simple bidirectional forward
-    def forward_to_twilio():
-        while True:
-            data = ws.receive()
-            if data is None:
-                break
-            ssl_sock.sendall(data.encode() if isinstance(data, str) else data)
+            async with websockets.connect(
+                "wss://chunder.twilio.com/signal",
+                **connect_kwargs
+            ) as twilio_ws:
+                print("[proxy] Connected to Twilio successfully")
 
-    def forward_to_browser():
-        while True:
-            data = ssl_sock.recv(4096)
-            if not data:
-                break
-            ws.send(data)
+                async def browser_to_twilio():
+                    while True:
+                        data = ws.receive()
+                        if data is None:
+                            print("[proxy] Browser disconnected")
+                            break
+                        await twilio_ws.send(data)
 
-    t1 = gevent.spawn(forward_to_twilio)
-    t2 = gevent.spawn(forward_to_browser)
-    gevent.joinall([t1, t2])
+                async def twilio_to_browser():
+                    async for message in twilio_ws:
+                        ws.send(message)
+
+                await asyncio.gather(
+                    browser_to_twilio(),
+                    twilio_to_browser()
+                )
+        except Exception as e:
+            print(f"[proxy error] {e}")
+
+    loop = asyncio.new_event_loop()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run())
+
+    t = threading.Thread(target=run_loop)
+    t.start()
+    t.join()
 
 
 # ─────────────────────────────
