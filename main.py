@@ -52,47 +52,48 @@ def token():
 async def signal_proxy(browser_ws: WebSocket):
     requested = browser_ws.headers.get("sec-websocket-protocol", "")
     subprotocols = [p.strip() for p in requested.split(",")] if requested else []
-    print(f"[proxy] subprotocols requested: {subprotocols}")
+    print(f"[proxy] subprotocols requested: {subprotocols}", flush=True)
 
     await browser_ws.accept(subprotocol=subprotocols[0] if subprotocols else None)
-    print("[proxy] Browser accepted")
+    print("[proxy] Browser accepted", flush=True)
 
     try:
-        # websockets v16 API
-        async with websockets.connect(
+        print("[proxy] Attempting to connect to Twilio...", flush=True)
+        twilio_ws = await websockets.connect(
             "wss://chunder.twilio.com/signal",
             extra_headers={
                 "Origin": "https://voice.twilio.com",
                 "User-Agent": "Mozilla/5.0 TwilioProxy/1.0",
-                "Sec-WebSocket-Protocol": ",".join(subprotocols) if subprotocols else "voice",
             },
-            open_timeout=10,
-        ) as twilio_ws:
-            print("[proxy] Connected to Twilio ✅")
+            subprotocols=subprotocols if subprotocols else None,
+            open_timeout=15,
+        )
+        print("[proxy] Connected to Twilio ✅", flush=True)
 
-            async def browser_to_twilio():
-                try:
-                    while True:
-                        data = await browser_ws.receive_text()
-                        await twilio_ws.send(data)
-                except Exception as e:
-                    print(f"[proxy] browser→twilio closed: {e}")
-                    await twilio_ws.close()
+        async def browser_to_twilio():
+            try:
+                while True:
+                    data = await browser_ws.receive_text()
+                    await twilio_ws.send(data)
+            except Exception as e:
+                print(f"[proxy] browser→twilio error: {type(e).__name__}: {e}", flush=True)
+                await twilio_ws.close()
 
-            async def twilio_to_browser():
-                try:
-                    async for message in twilio_ws:
-                        await browser_ws.send_text(message)
-                except Exception as e:
-                    print(f"[proxy] twilio→browser closed: {e}")
+        async def twilio_to_browser():
+            try:
+                async for message in twilio_ws:
+                    await browser_ws.send_text(message)
+            except Exception as e:
+                print(f"[proxy] twilio→browser error: {type(e).__name__}: {e}", flush=True)
 
-            await asyncio.gather(browser_to_twilio(), twilio_to_browser())
+        await asyncio.gather(browser_to_twilio(), twilio_to_browser())
 
     except Exception as e:
-        print(f"[proxy] Failed to connect to Twilio: {e}")
+        import traceback
+        print(f"[proxy] FAILED: {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
     finally:
-        print("[proxy] Connection closed")
-
+        print("[proxy] Connection closed", flush=True)
 
 # ─────────────────────────────
 # MAKE CALL
