@@ -160,6 +160,17 @@ async def dtmf(req: Request):
     gather.say("Press another key.", voice="alice")
     return JSONResponse(content=str(response), media_type="text/xml")
 
+@app.get("/test-twilio-reach")
+async def test_reach():
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection("chunder.twilio.com", 443),
+            timeout=5
+        )
+        writer.close()
+        return {"status": "✅ can reach Twilio"}
+    except Exception as e:
+        return {"status": f"❌ blocked: {e}"}
 
 # ─────────────────────────────
 # CALL STATUS
