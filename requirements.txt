@@ -1,6 +1,5 @@
-fastapi
+fastapi[standard]
 uvicorn
 gunicorn
 twilio
 python-dotenv
-websockets==13.1

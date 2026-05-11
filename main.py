@@ -1,13 +1,13 @@
 import os
 import asyncio
-import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
+from fastapi.responses import JSONResponse, Response
+
 
 app = FastAPI()
 
@@ -45,82 +45,19 @@ def token():
     return {"token": access_token.to_jwt()}
 
 
-# ─────────────────────────────
-# WEBSOCKET PROXY
-# ─────────────────────────────
-@app.websocket("/signal-proxy")
-async def signal_proxy(browser_ws: WebSocket):
-    requested = browser_ws.headers.get("sec-websocket-protocol", "")
-    subprotocols = [p.strip() for p in requested.split(",")] if requested else []
-    print(f"[proxy] subprotocols requested: {subprotocols}", flush=True)
-
-    await browser_ws.accept(subprotocol=subprotocols[0] if subprotocols else None)
-    print("[proxy] Browser accepted", flush=True)
-
-    try:
-        print("[proxy] Attempting to connect to Twilio...", flush=True)
-        twilio_ws = await websockets.connect(
-            "wss://chunder.twilio.com/signal",
-            extra_headers={
-                "Origin": "https://voice.twilio.com",
-                "User-Agent": "Mozilla/5.0 TwilioProxy/1.0",
-            },
-            subprotocols=subprotocols if subprotocols else None,
-            open_timeout=15,
-        )
-        print("[proxy] Connected to Twilio ✅", flush=True)
-
-        async def browser_to_twilio():
-            try:
-                while True:
-                    data = await browser_ws.receive_text()
-                    await twilio_ws.send(data)
-            except Exception as e:
-                print(f"[proxy] browser→twilio error: {type(e).__name__}: {e}", flush=True)
-                await twilio_ws.close()
-
-        async def twilio_to_browser():
-            try:
-                async for message in twilio_ws:
-                    await browser_ws.send_text(message)
-            except Exception as e:
-                print(f"[proxy] twilio→browser error: {type(e).__name__}: {e}", flush=True)
-
-        await asyncio.gather(browser_to_twilio(), twilio_to_browser())
-
-    except Exception as e:
-        import traceback
-        print(f"[proxy] FAILED: {type(e).__name__}: {e}", flush=True)
-        print(traceback.format_exc(), flush=True)
-    finally:
-        print("[proxy] Connection closed", flush=True)
-
-# ─────────────────────────────
-# MAKE CALL
-# ─────────────────────────────
-@app.post("/make-call")
-async def make_call(req: Request):
-    body = await req.json()
-    to = body.get("to")
-    print(f"Calling {to}...")
-    call = client.calls.create(
-        to=to,
-        from_=TWILIO_NUMBER,
-        url=f"{BASE_URL}/voice",
-        status_callback=f"{BASE_URL}/status",
-        status_callback_method="POST",
-        status_callback_event=["initiated", "ringing", "answered", "completed"],
-    )
-    print(f"Call SID: {call.sid}")
-    return {"call_sid": call.sid, "status": call.status}
-
-
-# ─────────────────────────────
-# VOICE (TwiML)
-# ─────────────────────────────
 @app.post("/voice")
 async def voice(req: Request):
-    print("/voice triggered")
+    form = await req.form()
+    to = form.get("To", "")
+    print(f"/voice triggered → dialing {to}")
+    response = VoiceResponse()
+    dial = response.dial(caller_id=TWILIO_NUMBER)
+    dial.number(to, url=f"{BASE_URL}/connected")
+    return Response(content=str(response), media_type="text/xml")  # use Response not JSONResponse
+
+
+@app.post("/connected")
+async def connected(req: Request):
     response = VoiceResponse()
     gather = response.gather(
         input="dtmf",
@@ -132,21 +69,15 @@ async def voice(req: Request):
     )
     gather.say("Hello! Please press any key on your keypad.", voice="alice")
     response.say("No input received. Goodbye!", voice="alice")
-    return JSONResponse(content=str(response), media_type="text/xml")
+    return Response(content=str(response), media_type="text/xml")  # same here
 
 
-# ─────────────────────────────
-# DTMF RECEIVER
-# ─────────────────────────────
 @app.post("/dtmf")
 async def dtmf(req: Request):
     form = await req.form()
-    digit    = form.get("Digits", "")
+    digit = form.get("Digits", "")
     call_sid = form.get("CallSid", "")
-    print("=" * 40)
-    print(f"DIGIT PRESSED : {digit}")
-    print(f"CALL SID      : {call_sid}")
-    print("=" * 40)
+    print(f"DIGIT PRESSED: {digit} | CALL SID: {call_sid}")
     response = VoiceResponse()
     response.say(f"You pressed {digit}.", voice="alice")
     gather = response.gather(
@@ -158,19 +89,8 @@ async def dtmf(req: Request):
         finish_on_key=""
     )
     gather.say("Press another key.", voice="alice")
-    return JSONResponse(content=str(response), media_type="text/xml")
+    return Response(content=str(response), media_type="text/xml")  # same here
 
-@app.get("/test-twilio-reach")
-async def test_reach():
-    try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection("chunder.twilio.com", 443),
-            timeout=5
-        )
-        writer.close()
-        return {"status": "✅ can reach Twilio"}
-    except Exception as e:
-        return {"status": f"❌ blocked: {e}"}
 
 # ─────────────────────────────
 # CALL STATUS
@@ -183,11 +103,3 @@ async def status(req: Request):
     duration    = form.get("CallDuration", "0")
     print(f"Status: {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
     return JSONResponse(content="", status_code=200)
-
-
-# ─────────────────────────────
-# HEALTH CHECK
-# ─────────────────────────────
-@app.get("/health")
-def health():
-    return {"status": "ok"}
