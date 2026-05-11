@@ -61,7 +61,7 @@ async def signal_proxy(browser_ws: WebSocket):
         # websockets v16 API
         async with websockets.connect(
             "wss://chunder.twilio.com/signal",
-            additional_headers={
+            extra_headers={
                 "Origin": "https://voice.twilio.com",
                 "User-Agent": "Mozilla/5.0 TwilioProxy/1.0",
                 "Sec-WebSocket-Protocol": ",".join(subprotocols) if subprotocols else "voice",
