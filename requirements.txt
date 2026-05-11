@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+gunicorn
 twilio
 python-dotenv
-websockets
+websockets==13.1
