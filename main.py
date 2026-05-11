@@ -1,17 +1,22 @@
 import os
 import asyncio
-import threading
 import websockets
-import websockets.server
-from flask import Flask, jsonify, request
+from fastapi import FastAPI, WebSocket, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
-from flask_cors import CORS
 
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 ACCOUNT_SID   = os.environ["ACCOUNT_SID"]
 AUTH_TOKEN    = os.environ["AUTH_TOKEN"]
@@ -27,28 +32,71 @@ client = Client(ACCOUNT_SID, AUTH_TOKEN)
 # ─────────────────────────────
 # TOKEN
 # ─────────────────────────────
-@app.route("/token")
+@app.get("/token")
 def token():
     access_token = AccessToken(
-        ACCOUNT_SID,
-        API_KEY,
-        API_SECRET,
-        identity="visitor"
+        ACCOUNT_SID, API_KEY, API_SECRET, identity="visitor"
     )
     voice_grant = VoiceGrant(
         outgoing_application_sid=TWIML_APP_SID,
         incoming_allow=True
     )
     access_token.add_grant(voice_grant)
-    return jsonify({"token": access_token.to_jwt()})
+    return {"token": access_token.to_jwt()}
+
+
+# ─────────────────────────────
+# WEBSOCKET PROXY
+# ─────────────────────────────
+@app.websocket("/signal-proxy")
+async def signal_proxy(browser_ws: WebSocket):
+    # Accept with voice subprotocol if requested
+    headers = dict(browser_ws.headers)
+    requested = headers.get("sec-websocket-protocol", "")
+    subprotocols = [p.strip() for p in requested.split(",")] if requested else []
+    print(f"[proxy] subprotocols requested: {subprotocols}")
+
+    await browser_ws.accept(subprotocol=subprotocols[0] if subprotocols else None)
+
+    try:
+        async with websockets.connect(
+            "wss://chunder.twilio.com/signal",
+            subprotocols=subprotocols if subprotocols else None,
+            extra_headers={
+                "Origin": "https://voice.twilio.com",
+                "User-Agent": "Mozilla/5.0 TwilioProxy/1.0",
+            }
+        ) as twilio_ws:
+            print("[proxy] Connected to Twilio ✅")
+
+            async def browser_to_twilio():
+                try:
+                    while True:
+                        data = await browser_ws.receive_text()
+                        await twilio_ws.send(data)
+                except Exception as e:
+                    print(f"[proxy] browser→twilio closed: {e}")
+
+            async def twilio_to_browser():
+                try:
+                    async for message in twilio_ws:
+                        await browser_ws.send_text(message)
+                except Exception as e:
+                    print(f"[proxy] twilio→browser closed: {e}")
+
+            await asyncio.gather(browser_to_twilio(), twilio_to_browser())
+
+    except Exception as e:
+        print(f"[proxy] error: {e}")
 
 
 # ─────────────────────────────
 # MAKE CALL
 # ─────────────────────────────
-@app.route("/make-call", methods=["POST"])
-def make_call():
-    to = request.json.get("to")
+@app.post("/make-call")
+async def make_call(req: Request):
+    body = await req.json()
+    to = body.get("to")
     print(f"Calling {to}...")
     call = client.calls.create(
         to=to,
@@ -59,14 +107,14 @@ def make_call():
         status_callback_event=["initiated", "ringing", "answered", "completed"],
     )
     print(f"Call SID: {call.sid}")
-    return jsonify({"call_sid": call.sid, "status": call.status})
+    return {"call_sid": call.sid, "status": call.status}
 
 
 # ─────────────────────────────
 # VOICE (TwiML)
 # ─────────────────────────────
-@app.route("/voice", methods=["POST"])
-def voice():
+@app.post("/voice")
+async def voice(req: Request):
     print("/voice triggered")
     response = VoiceResponse()
     gather = response.gather(
@@ -79,16 +127,17 @@ def voice():
     )
     gather.say("Hello! Please press any key on your keypad.", voice="alice")
     response.say("No input received. Goodbye!", voice="alice")
-    return str(response)
+    return JSONResponse(content=str(response), media_type="text/xml")
 
 
 # ─────────────────────────────
 # DTMF RECEIVER
 # ─────────────────────────────
-@app.route("/dtmf", methods=["POST"])
-def dtmf():
-    digit    = request.form.get("Digits", "")
-    call_sid = request.form.get("CallSid", "")
+@app.post("/dtmf")
+async def dtmf(req: Request):
+    form = await req.form()
+    digit    = form.get("Digits", "")
+    call_sid = form.get("CallSid", "")
     print("=" * 40)
     print(f"DIGIT PRESSED : {digit}")
     print(f"CALL SID      : {call_sid}")
@@ -104,90 +153,25 @@ def dtmf():
         finish_on_key=""
     )
     gather.say("Press another key.", voice="alice")
-    return str(response)
+    return JSONResponse(content=str(response), media_type="text/xml")
 
 
 # ─────────────────────────────
 # CALL STATUS
 # ─────────────────────────────
-@app.route("/status", methods=["POST"])
-def status():
-    call_status = request.form.get("CallStatus", "")
-    call_sid    = request.form.get("CallSid", "")
-    duration    = request.form.get("CallDuration", "0")
+@app.post("/status")
+async def status(req: Request):
+    form = await req.form()
+    call_status = form.get("CallStatus", "")
+    call_sid    = form.get("CallSid", "")
+    duration    = form.get("CallDuration", "0")
     print(f"Status: {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
-    return "", 200
+    return JSONResponse(content="", status_code=200)
 
 
 # ─────────────────────────────
 # HEALTH CHECK
 # ─────────────────────────────
-@app.route("/health")
+@app.get("/health")
 def health():
-    return jsonify({"status": "ok"}), 200
-
-
-# ─────────────────────────────
-# WEBSOCKET PROXY SERVER
-# Runs on port 8765 alongside Flask
-# ─────────────────────────────
-async def proxy_handler(browser_ws):
-    # Forward whatever subprotocol the browser requested
-    subprotocols = list(browser_ws.subprotocols) if browser_ws.subprotocols else []
-    print(f"[proxy] New connection, subprotocols: {subprotocols}")
-
-    try:
-        async with websockets.connect(
-            "wss://chunder.twilio.com/signal",
-            subprotocols=subprotocols or None,
-            extra_headers={
-                "Origin": "https://voice.twilio.com",
-                "User-Agent": "Mozilla/5.0 TwilioProxy/1.0",
-            }
-        ) as twilio_ws:
-            print("[proxy] Connected to Twilio ✅")
-
-            async def browser_to_twilio():
-                try:
-                    async for message in browser_ws:
-                        await twilio_ws.send(message)
-                except Exception as e:
-                    print(f"[proxy] browser→twilio error: {e}")
-
-            async def twilio_to_browser():
-                try:
-                    async for message in twilio_ws:
-                        await browser_ws.send(message)
-                except Exception as e:
-                    print(f"[proxy] twilio→browser error: {e}")
-
-            await asyncio.gather(browser_to_twilio(), twilio_to_browser())
-
-    except Exception as e:
-        print(f"[proxy] Connection error: {e}")
-
-
-def start_proxy():
-    port = int(os.environ.get("WS_PORT", 8765))
-    print(f"[proxy] WebSocket proxy starting on port {port}")
-
-    async def serve():
-        async with websockets.serve(
-            proxy_handler,
-            "0.0.0.0",
-            port,
-            subprotocols=["voice"],  # accept voice subprotocol
-        ):
-            print(f"[proxy] Listening on ws://0.0.0.0:{port}")
-            await asyncio.Future()  # run forever
-
-    asyncio.run(serve())
-
-
-# Start proxy in background thread when app loads
-proxy_thread = threading.Thread(target=start_proxy, daemon=True)
-proxy_thread.start()
-
-
-if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    return {"status": "ok"}

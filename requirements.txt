@@ -1,6 +1,5 @@
-flask
-flask-cors
+fastapi
+uvicorn
 twilio
-gunicorn
 python-dotenv
 websockets
