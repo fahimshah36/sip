@@ -1,13 +1,17 @@
 import os
+import asyncio
+import websockets
 from flask import Flask, jsonify, request
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
-from twilio.twiml.voice_response import VoiceResponse, Dial
+from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
 from flask_cors import CORS
+from flask_sock import Sock
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+sock = Sock(app)
 
 ACCOUNT_SID   = os.environ["ACCOUNT_SID"]
 AUTH_TOKEN    = os.environ["AUTH_TOKEN"]
@@ -20,6 +24,9 @@ BASE_URL      = os.environ["BASE_URL"]
 client = Client(ACCOUNT_SID, AUTH_TOKEN)
 
 
+# ─────────────────────────────
+# TOKEN
+# ─────────────────────────────
 @app.route("/token")
 def token():
     access_token = AccessToken(
@@ -34,6 +41,40 @@ def token():
     )
     access_token.add_grant(voice_grant)
     return jsonify({"token": access_token.to_jwt()})
+
+
+# ─────────────────────────────
+# WEBSOCKET PROXY
+# Forwards browser <-> Twilio signaling
+# so BD network block is bypassed
+# ─────────────────────────────
+@sock.route("/signal-proxy")
+def signal_proxy(ws):
+    async def run():
+        try:
+            async with websockets.connect(
+                "wss://chunder.twilio.com/signal",
+                extra_headers={"User-Agent": "TwilioProxy/1.0"}
+            ) as twilio_ws:
+                async def browser_to_twilio():
+                    while True:
+                        data = ws.receive()
+                        if data is None:
+                            break
+                        await twilio_ws.send(data)
+
+                async def twilio_to_browser():
+                    async for message in twilio_ws:
+                        ws.send(message)
+
+                await asyncio.gather(
+                    browser_to_twilio(),
+                    twilio_to_browser()
+                )
+        except Exception as e:
+            print(f"[proxy error] {e}")
+
+    asyncio.run(run())
 
 
 # ─────────────────────────────
@@ -111,6 +152,10 @@ def status():
     print(f"Status: {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
     return "", 200
 
+
+# ─────────────────────────────
+# HEALTH CHECK
+# ─────────────────────────────
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"}), 200

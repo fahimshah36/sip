@@ -1,5 +1,7 @@
 flask
 flask-cors
+flask-sock
 twilio
 gunicorn
 python-dotenv
+websockets
