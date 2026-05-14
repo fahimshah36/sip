@@ -76,9 +76,10 @@ async def make_call(req: Request):
 async def voice(req: Request):
     form = await req.form()
     to = form.get("To", "")
+    site_no = form.get("siteNo", "")
     parent_sid = form.get("CallSid", "")
     print(f"/voice triggered → dialing {to} | parent SID: {parent_sid}")
-
+    print(f"[WARNING] Requested SIteNo {site_no}")
     if parent_sid:
         call_status_queues[parent_sid]  # initialize queue
 
