@@ -6,9 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Gather
 from twilio.rest import Client
-from twilio.twiml.voice_response import Dial, Number
 
 app = FastAPI()
 
@@ -29,7 +28,8 @@ BASE_URL      = os.environ["BASE_URL"]
 
 client = Client(ACCOUNT_SID, AUTH_TOKEN)
 
-# In-memory queues for real-time call status push via SSE
+# In-memory queues for real-time push via SSE
+# key = parent CallSid, value = asyncio.Queue of event strings
 call_status_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
 
@@ -50,7 +50,7 @@ def token():
 
 
 # ─────────────────────────────
-# MAKE CALL (kept for reference, not used by browser SDK flow)
+# MAKE CALL (kept for reference)
 # ─────────────────────────────
 @app.post("/make-call")
 async def make_call(req: Request):
@@ -70,7 +70,7 @@ async def make_call(req: Request):
 
 
 # ─────────────────────────────
-# VOICE — dials the phone
+# VOICE — dials the phone + starts DTMF gather loop
 # ─────────────────────────────
 @app.post("/voice")
 async def voice(req: Request):
@@ -79,11 +79,12 @@ async def voice(req: Request):
     parent_sid = form.get("CallSid", "")
     print(f"/voice triggered → dialing {to} | parent SID: {parent_sid}")
 
-    # Initialize SSE queue for this call
     if parent_sid:
         call_status_queues[parent_sid]  # initialize queue
 
     response = VoiceResponse()
+
+    # Dial the phone with answer_on_bridge so SDK accept = phone answered
     dial = Dial(
         caller_id=TWILIO_NUMBER,
         answer_on_bridge=True,
@@ -98,12 +99,23 @@ async def voice(req: Request):
     )
     dial.append(number)
     response.append(dial)
+
+    # After dial ends, start DTMF gather loop
+    gather = Gather(
+        input="dtmf",
+        action=f"{BASE_URL}/dtmf",
+        method="POST",
+        num_digits=1,
+        timeout=0,
+        finish_on_key="",
+    )
+    response.append(gather)
+
     return Response(content=str(response), media_type="text/xml")
 
 
 # ─────────────────────────────
 # CHILD CALL STATUS — phone leg events
-# Twilio POSTs here when the phone rings/answers/hangs up
 # ─────────────────────────────
 @app.post("/child-status")
 async def child_status(req: Request):
@@ -120,7 +132,38 @@ async def child_status(req: Request):
 
 
 # ─────────────────────────────
-# SSE — browser subscribes to real-time call events
+# DTMF — callee pressed a key, push to browser via SSE
+# then loop back to gather more digits
+# ─────────────────────────────
+@app.post("/dtmf")
+async def dtmf(req: Request):
+    form = await req.form()
+    digit      = form.get("Digits", "")
+    call_sid   = form.get("CallSid", "")
+    parent_sid = form.get("ParentCallSid", call_sid)  # fallback to self if top-level
+    print(f"[dtmf] digit={digit} | call={call_sid} | parent={parent_sid}")
+
+    # Push digit to SSE queue
+    target_sid = parent_sid if parent_sid in call_status_queues else call_sid
+    if target_sid in call_status_queues:
+        await call_status_queues[target_sid].put(f"dtmf:{digit}")
+
+    # Return another Gather to keep listening for more digits
+    response = VoiceResponse()
+    gather = Gather(
+        input="dtmf",
+        action=f"{BASE_URL}/dtmf",
+        method="POST",
+        num_digits=1,
+        timeout=0,
+        finish_on_key="",
+    )
+    response.append(gather)
+    return Response(content=str(response), media_type="text/xml")
+
+
+# ─────────────────────────────
+# SSE — browser subscribes to real-time call events + DTMF
 # ─────────────────────────────
 @app.get("/call-events/{call_sid}")
 async def call_events(call_sid: str):
@@ -130,12 +173,12 @@ async def call_events(call_sid: str):
         try:
             while True:
                 try:
-                    status = await asyncio.wait_for(queue.get(), timeout=25)
-                    yield f"data: {status}\n\n"
-                    if status in ("completed", "failed", "busy", "no-answer", "canceled"):
+                    event = await asyncio.wait_for(queue.get(), timeout=25)
+                    yield f"data: {event}\n\n"
+                    if event in ("completed", "failed", "busy", "no-answer", "canceled"):
                         break
                 except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"  # prevent proxy timeout
+                    yield ": keepalive\n\n"
         except asyncio.CancelledError:
             pass
 
@@ -150,15 +193,14 @@ async def call_events(call_sid: str):
 
 
 # ─────────────────────────────
-# DIAL COMPLETE — runs after callee hangs up
+# DIAL COMPLETE
 # ─────────────────────────────
 @app.post("/dial-complete")
 async def dial_complete(req: Request):
     form = await req.form()
     dial_status = form.get("DialCallStatus", "")
     print(f"/dial-complete → DialCallStatus: {dial_status}")
-    response = VoiceResponse()
-    return Response(content=str(response), media_type="text/xml")
+    return Response(content=str(VoiceResponse()), media_type="text/xml")
 
 
 # ─────────────────────────────
@@ -170,7 +212,7 @@ async def status(req: Request):
     call_status = form.get("CallStatus", "")
     call_sid    = form.get("CallSid", "")
     duration    = form.get("CallDuration", "0")
-    print(f"[parent-status] {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
+    print(f"[status] {call_status.upper()} | SID: {call_sid} | Duration: {duration}s")
 
     if call_sid in call_status_queues and call_status in ("completed", "failed"):
         await call_status_queues[call_sid].put(call_status)
