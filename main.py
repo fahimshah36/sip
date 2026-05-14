@@ -79,13 +79,12 @@ async def voice(req: Request):
     site_no = form.get("siteNo", "")
     parent_sid = form.get("CallSid", "")
     print(f"/voice triggered → dialing {to} | parent SID: {parent_sid}")
-    print(f"[WARNING] Requested SIteNo {site_no}")
+    print(f"[WARNING] Requested SiteNo {site_no}")
+
     if parent_sid:
-        call_status_queues[parent_sid]  # initialize queue
+        call_status_queues[parent_sid]
 
     response = VoiceResponse()
-
-    # Dial the phone with answer_on_bridge so SDK accept = phone answered
     dial = Dial(
         caller_id=TWILIO_NUMBER,
         answer_on_bridge=True,
@@ -94,24 +93,30 @@ async def voice(req: Request):
     )
     number = Number(
         to,
+        url=f"{BASE_URL}/child-twiml?parent={parent_sid}",
+        method="POST",
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
     )
     dial.append(number)
     response.append(dial)
+    return Response(content=str(response), media_type="text/xml")
 
-    # After dial ends, start DTMF gather loop
+@app.post("/child-twiml")
+async def child_twiml(req: Request):
+    parent_sid = req.query_params.get("parent", "")
+    print(f"[child-twiml] parent: {parent_sid}")
+    response = VoiceResponse()
     gather = Gather(
         input="dtmf",
-        action=f"{BASE_URL}/dtmf",
+        action=f"{BASE_URL}/dtmf?parent={parent_sid}",
         method="POST",
         num_digits=1,
-        timeout=0,
+        timeout=60,
         finish_on_key="",
     )
     response.append(gather)
-
     return Response(content=str(response), media_type="text/xml")
 
 
@@ -138,25 +143,22 @@ async def child_status(req: Request):
 # ─────────────────────────────
 @app.post("/dtmf")
 async def dtmf(req: Request):
+    parent_sid = req.query_params.get("parent", "")
     form = await req.form()
-    digit      = form.get("Digits", "")
-    call_sid   = form.get("CallSid", "")
-    parent_sid = form.get("ParentCallSid", call_sid)  # fallback to self if top-level
-    print(f"[dtmf] digit={digit} | call={call_sid} | parent={parent_sid}")
+    digit = form.get("Digits", "")
+    print(f"[dtmf] digit={digit} | parent={parent_sid}")
 
-    # Push digit to SSE queue
-    target_sid = parent_sid if parent_sid in call_status_queues else call_sid
-    if target_sid in call_status_queues:
-        await call_status_queues[target_sid].put(f"dtmf:{digit}")
+    if parent_sid and parent_sid in call_status_queues:
+        await call_status_queues[parent_sid].put(f"dtmf:{digit}")
 
-    # Return another Gather to keep listening for more digits
+    # Loop back for more digits
     response = VoiceResponse()
     gather = Gather(
         input="dtmf",
-        action=f"{BASE_URL}/dtmf",
+        action=f"{BASE_URL}/dtmf?parent={parent_sid}",
         method="POST",
         num_digits=1,
-        timeout=0,
+        timeout=60,
         finish_on_key="",
     )
     response.append(gather)
