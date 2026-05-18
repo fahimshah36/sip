@@ -112,11 +112,13 @@ async def child_twiml(req: Request):
         action=f"{BASE_URL}/dtmf?parent={parent_sid}",
         method="POST",
         num_digits=1,
-        timeout=0,          # ← 0 means don't wait, just listen
+        timeout=60,        # ← wait up to 60s for a digit
         finish_on_key="",
-        enhanced=True,      # ← detects DTMF without interrupting audio
+        enhanced=True,     # ← don't interrupt audio
     )
     response.append(gather)
+    # Loop back if no digit pressed after timeout
+    response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
     return Response(content=str(response), media_type="text/xml")
 
 
@@ -151,7 +153,7 @@ async def dtmf(req: Request):
     if parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(f"dtmf:{digit}")
 
-    # Loop back for more digits
+    # Loop back for more digits with enhanced=True
     response = VoiceResponse()
     gather = Gather(
         input="dtmf",
@@ -160,8 +162,10 @@ async def dtmf(req: Request):
         num_digits=1,
         timeout=60,
         finish_on_key="",
+        enhanced=True,     # ← keep audio bridge intact
     )
     response.append(gather)
+    response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
     return Response(content=str(response), media_type="text/xml")
 
 
