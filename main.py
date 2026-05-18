@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
-from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Connect, Stream
+from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Start, Stream
 
 app = FastAPI()
 
@@ -54,17 +54,17 @@ async def voice(req: Request):
 
     _ = call_status_queues[parent_sid]  # pre-create queue
 
-    # wss:// URL for Media Streams
     ws_base = BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
 
     response = VoiceResponse()
 
-    # ── Passive DTMF listener (does NOT affect the call/bridge in any way) ──
-    connect = Connect()
-    connect.stream(url=f"{ws_base}/media-stream/{parent_sid}")
-    response.append(connect)
+    # ── <Start><Stream> is NON-BLOCKING — starts stream then immediately
+    #    falls through to <Dial>. Does not affect the call or bridge at all.
+    start = Start()
+    start.stream(url=f"{ws_base}/media-stream/{parent_sid}")
+    response.append(start)
 
-    # ── Dial — completely unchanged from your working version ──
+    # ── Dial — completely unchanged ────────────────────────────────────────
     dial = Dial(
         caller_id=TWILIO_NUMBER,
         answer_on_bridge=True,
@@ -82,7 +82,7 @@ async def voice(req: Request):
     return Response(content=str(response), media_type="text/xml")
 
 
-# ── Media Streams WebSocket — DTMF only, ignores audio frames ─────────────────
+# ── Media Streams WebSocket — DTMF only ───────────────────────────────────────
 
 @app.websocket("/media-stream/{call_sid}")
 async def media_stream(websocket: WebSocket, call_sid: str):
@@ -97,8 +97,6 @@ async def media_stream(websocket: WebSocket, call_sid: str):
                 print(f"[dtmf] digit={digit}  call_sid={call_sid}")
                 if digit and call_sid in call_status_queues:
                     await call_status_queues[call_sid].put(f"dtmf:{digit}")
-
-            # "connected", "start", "media", "stop" — all ignored
 
     except WebSocketDisconnect:
         pass
