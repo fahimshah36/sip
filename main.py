@@ -8,8 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
-from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Start, Gather
-from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Start
 
 app = FastAPI()
 
@@ -28,14 +27,8 @@ TWIML_APP_SID = os.environ["TWIML_APP_SID"]
 TWILIO_NUMBER = os.environ["TWILIO_NUMBER"]
 BASE_URL      = os.environ["BASE_URL"]
 
-twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN)
-
 call_status_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
-# Map child SID -> parent SID so DTMF callback can find the right queue
-child_to_parent: dict[str, str] = {}
 
-
-# ── Token ──────────────────────────────────────────────────────────────────────
 
 @app.get("/token")
 def token():
@@ -48,8 +41,6 @@ def token():
     ))
     return {"token": access_token.to_jwt()}
 
-
-# ── Voice webhook ──────────────────────────────────────────────────────────────
 
 @app.post("/voice")
 async def voice(req: Request):
@@ -80,86 +71,12 @@ async def voice(req: Request):
         to,
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
-        # Remove dtmf from here — it doesn't work on Number
         status_callback_event="initiated ringing answered completed",
     ))
     response.append(dial)
 
     return Response(content=str(response), media_type="text/xml")
 
-
-# ── Child status: detect "answered" then redirect child leg to gather TwiML ────
-
-@app.post("/child-status")
-async def child_status(req: Request):
-    form        = await req.form()
-    call_status = form.get("CallStatus", "")
-    parent_sid  = form.get("ParentCallSid", "")
-    child_sid   = form.get("CallSid", "")
-
-    print(f"[child-status] {call_status}  child={child_sid}  parent={parent_sid}")
-
-    if parent_sid and parent_sid in call_status_queues:
-        await call_status_queues[parent_sid].put(call_status)
-
-    # When child answers, redirect it to a looping Gather TwiML
-    # This runs in the background so we don't block the status callback response
-    if call_status == "in-progress" and child_sid and parent_sid:
-        child_to_parent[child_sid] = parent_sid
-        asyncio.create_task(redirect_child_to_gather(child_sid))
-
-    return Response(content="", status_code=200)
-
-
-async def redirect_child_to_gather(child_sid: str):
-    # Small delay to let the bridge fully establish first
-    await asyncio.sleep(1)
-    try:
-        twilio_client.calls(child_sid).update(
-            url=f"{BASE_URL}/child-gather",
-            method="POST",
-        )
-        print(f"[gather] redirected child {child_sid} to gather TwiML")
-    except Exception as e:
-        print(f"[gather] redirect failed: {e}")
-
-
-# ── Gather TwiML for child leg ─────────────────────────────────────────────────
-
-@app.post("/child-gather")
-async def child_gather(req: Request):
-    """
-    Looping Gather on the child leg.
-    numDigits=1 catches each keypress immediately.
-    action posts back here so we loop forever.
-    timeout=600 = 10 minutes, effectively keeps gathering for call duration.
-    """
-    form      = await req.form()
-    digit     = form.get("Digits", "")
-    child_sid = form.get("CallSid", "")
-
-    print(f"[child-gather] digit={digit!r}  child={child_sid}")
-
-    if digit and child_sid in child_to_parent:
-        parent_sid = child_to_parent[child_sid]
-        await call_status_queues[parent_sid].put(f"dtmf:{digit}")
-        print(f"[child-gather] forwarded dtmf:{digit} to parent {parent_sid}")
-
-    # Loop: keep gathering
-    response = VoiceResponse()
-    gather = Gather(
-        num_digits=1,
-        action=f"{BASE_URL}/child-gather",
-        method="POST",
-        timeout=600,
-        action_on_empty_result=True,
-    )
-    response.append(gather)
-
-    return Response(content=str(response), media_type="text/xml")
-
-
-# ── Media Streams WebSocket ────────────────────────────────────────────────────
 
 @app.websocket("/media-stream/{call_sid}")
 async def media_stream(websocket: WebSocket, call_sid: str):
@@ -176,7 +93,18 @@ async def media_stream(websocket: WebSocket, call_sid: str):
         print(f"[media-stream] error: {e}")
 
 
-# ── SSE stream ─────────────────────────────────────────────────────────────────
+@app.post("/child-status")
+async def child_status(req: Request):
+    form        = await req.form()
+    call_status = form.get("CallStatus", "")
+    parent_sid  = form.get("ParentCallSid", "")
+    print(f"[child-status] {call_status}  parent={parent_sid}")
+
+    if parent_sid and parent_sid in call_status_queues:
+        await call_status_queues[parent_sid].put(call_status)
+
+    return Response(content="", status_code=200)
+
 
 @app.get("/call-events/{call_sid}")
 async def call_events(call_sid: str):
@@ -202,8 +130,6 @@ async def call_events(call_sid: str):
     )
 
 
-# ── Dial complete ──────────────────────────────────────────────────────────────
-
 @app.post("/dial-complete")
 async def dial_complete(req: Request):
     form       = await req.form()
@@ -217,8 +143,6 @@ async def dial_complete(req: Request):
 
     return Response(content=str(VoiceResponse()), media_type="text/xml")
 
-
-# ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
