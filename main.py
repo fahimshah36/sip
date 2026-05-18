@@ -67,6 +67,7 @@ async def voice(req: Request):
     response = VoiceResponse()
     dial = Dial(
         caller_id=TWILIO_NUMBER,
+        answer_on_bridge=True,
         action=f"{BASE_URL}/dial-complete",
         method="POST",
     )
