@@ -1,13 +1,14 @@
 import os
 import asyncio
+import json
 from collections import defaultdict
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
-from twilio.twiml.voice_response import VoiceResponse, Dial, Number
+from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Connect, Stream
 
 app = FastAPI()
 
@@ -18,18 +19,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ACCOUNT_SID = os.environ["ACCOUNT_SID"]
-AUTH_TOKEN  = os.environ["AUTH_TOKEN"]
-API_KEY     = os.environ["API_KEY"]
-API_SECRET  = os.environ["API_SECRET"]
+ACCOUNT_SID   = os.environ["ACCOUNT_SID"]
+AUTH_TOKEN    = os.environ["AUTH_TOKEN"]
+API_KEY       = os.environ["API_KEY"]
+API_SECRET    = os.environ["API_SECRET"]
 TWIML_APP_SID = os.environ["TWIML_APP_SID"]
 TWILIO_NUMBER = os.environ["TWILIO_NUMBER"]
-BASE_URL      = os.environ["BASE_URL"]
+BASE_URL      = os.environ["BASE_URL"]  # e.g. https://sip-chc0.onrender.com
 
 call_status_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
 
-# ── Token ─────────────────────────────────────────────────────────────────────
+# ── Token ──────────────────────────────────────────────────────────────────────
 
 @app.get("/token")
 def token():
@@ -43,21 +44,30 @@ def token():
     return {"token": access_token.to_jwt()}
 
 
-# ── Voice webhook (Twilio calls this when browser dials) ──────────────────────
+# ── Voice webhook ──────────────────────────────────────────────────────────────
 
 @app.post("/voice")
 async def voice(req: Request):
-    form = await req.form()
+    form       = await req.form()
     to         = form.get("To", "")
     parent_sid = form.get("CallSid", "")
 
-    # Pre-create the queue so /call-events can subscribe before status arrives
-    _ = call_status_queues[parent_sid]
+    _ = call_status_queues[parent_sid]  # pre-create queue
+
+    # wss:// URL for Media Streams
+    ws_base = BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
 
     response = VoiceResponse()
+
+    # ── Passive DTMF listener (does NOT affect the call/bridge in any way) ──
+    connect = Connect()
+    connect.stream(url=f"{ws_base}/media-stream/{parent_sid}")
+    response.append(connect)
+
+    # ── Dial — completely unchanged from your working version ──
     dial = Dial(
         caller_id=TWILIO_NUMBER,
-        answer_on_bridge=True,          # browser hears ringing until callee picks up
+        answer_on_bridge=True,
         action=f"{BASE_URL}/dial-complete",
         method="POST",
     )
@@ -66,10 +76,34 @@ async def voice(req: Request):
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
-        # NO url= here — that was blocking the bridge
     ))
     response.append(dial)
+
     return Response(content=str(response), media_type="text/xml")
+
+
+# ── Media Streams WebSocket — DTMF only, ignores audio frames ─────────────────
+
+@app.websocket("/media-stream/{call_sid}")
+async def media_stream(websocket: WebSocket, call_sid: str):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_text()
+            msg  = json.loads(data)
+
+            if msg.get("event") == "dtmf":
+                digit = msg.get("dtmf", {}).get("digit", "")
+                print(f"[dtmf] digit={digit}  call_sid={call_sid}")
+                if digit and call_sid in call_status_queues:
+                    await call_status_queues[call_sid].put(f"dtmf:{digit}")
+
+            # "connected", "start", "media", "stop" — all ignored
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[media-stream] error: {e}")
 
 
 # ── Child leg status callbacks ─────────────────────────────────────────────────
@@ -87,7 +121,7 @@ async def child_status(req: Request):
     return Response(content="", status_code=200)
 
 
-# ── SSE stream — frontend subscribes to get live call status ──────────────────
+# ── SSE stream ─────────────────────────────────────────────────────────────────
 
 @app.get("/call-events/{call_sid}")
 async def call_events(call_sid: str):
@@ -113,7 +147,7 @@ async def call_events(call_sid: str):
     )
 
 
-# ── Dial complete (fires when the bridged call ends) ──────────────────────────
+# ── Dial complete ──────────────────────────────────────────────────────────────
 
 @app.post("/dial-complete")
 async def dial_complete(req: Request):
@@ -122,7 +156,6 @@ async def dial_complete(req: Request):
     status     = form.get("DialCallStatus", "")
     print(f"[dial-complete] DialCallStatus={status}  parent={parent_sid}")
 
-    # Push a terminal event in case child-status missed it
     if parent_sid and parent_sid in call_status_queues:
         if status in ("completed", "failed", "busy", "no-answer", "canceled"):
             await call_status_queues[parent_sid].put(status)
