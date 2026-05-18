@@ -58,8 +58,9 @@ async def voice(req: Request):
 
     response = VoiceResponse()
 
+    # Keep your media stream for other purposes if needed, or remove it
+    # since it's not giving you DTMF anyway
     start = Start()
-    # ADD: dtmf="true" tells Twilio to emit dtmf events on the stream
     start.stream(
         url=f"{ws_base}/media-stream/{parent_sid}",
         track="both_tracks",
@@ -76,7 +77,8 @@ async def voice(req: Request):
         to,
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
-        status_callback_event="initiated ringing answered completed",
+        # ADD "dtmf" to the event list
+        status_callback_event="initiated ringing answered completed dtmf",
     ))
     response.append(dial)
 
@@ -123,10 +125,19 @@ async def child_status(req: Request):
     form        = await req.form()
     call_status = form.get("CallStatus", "")
     parent_sid  = form.get("ParentCallSid", "")
-    print(f"[child-status] {call_status}  parent={parent_sid}")
+    
+    # Twilio sends Digits field when a DTMF event fires
+    digits      = form.get("Digits", "")
+
+    print(f"[child-status] status={call_status}  digits={digits!r}  parent={parent_sid}")
 
     if parent_sid and parent_sid in call_status_queues:
-        await call_status_queues[parent_sid].put(call_status)
+        if digits:
+            # Send each digit separately so frontend handles them individually
+            for digit in digits:
+                await call_status_queues[parent_sid].put(f"dtmf:{digit}")
+        elif call_status:
+            await call_status_queues[parent_sid].put(call_status)
 
     return Response(content="", status_code=200)
 
