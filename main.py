@@ -1,21 +1,22 @@
 import os
 import asyncio
 import json
-try:
-    import audioop
-except ImportError:
-    import audioop_lts as audioop
 import struct
 import math
 import base64
 from collections import defaultdict
+
+try:
+    import audioop
+except ImportError:
+    import audioop_lts as audioop
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
-from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Start, Stream
+from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Start
 
 app = FastAPI()
 
@@ -67,14 +68,18 @@ def goertzel(samples: list[float], target_freq: float, sample_rate: int) -> floa
 def detect_dtmf(pcm_samples: list[float]) -> str | None:
     powers = {f: goertzel(pcm_samples, f, SAMPLE_RATE) for f in ALL_FREQS}
     total  = sum(powers.values())
-    if total < 1e6:
+
+    if total < 1000:
         return None
+
     low_f  = max((f for f in ALL_FREQS if f <= 941),  key=lambda f: powers[f])
     high_f = max((f for f in ALL_FREQS if f >= 1209), key=lambda f: powers[f])
     low_p  = powers[low_f]  / total
     high_p = powers[high_f] / total
-    if low_p < 0.15 or high_p < 0.15:
+
+    if low_p < 0.10 or high_p < 0.10:
         return None
+
     for digit, (lf, hf) in DTMF_FREQS.items():
         if lf == low_f and hf == high_f:
             return digit
@@ -87,7 +92,7 @@ class DtmfDetector:
         self.last_digit: str | None = None
         self.confirm_count  = 0
         self.silence_count  = 0
-        self.CONFIRM_FRAMES = 3  # ~60ms of consistent tone
+        self.CONFIRM_FRAMES = 2
         self.SILENCE_RESET  = 2
 
     def feed(self, mulaw_b64: str) -> str | None:
@@ -186,14 +191,15 @@ async def media_stream(websocket: WebSocket, call_sid: str):
     detector = dtmf_detectors[call_sid]
     try:
         while True:
-            data = await websocket.receive_text()
-            msg  = json.loads(data)
+            data  = await websocket.receive_text()
+            msg   = json.loads(data)
             event = msg.get("event")
 
             if event == "media":
                 media = msg.get("media", {})
                 if media.get("track") == "outbound":
-                    digit = detector.feed(media.get("payload", ""))
+                    payload = media.get("payload", "")
+                    digit   = detector.feed(payload)
                     if digit:
                         print(f"[dtmf] detected={digit!r}  call_sid={call_sid}")
                         asyncio.create_task(
