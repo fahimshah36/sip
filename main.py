@@ -82,6 +82,17 @@ async def voice(req: Request):
         call_status_queues[parent_sid]
 
     response = VoiceResponse()
+
+    gather = Gather(
+        input="dtmf",
+        action=f"{BASE_URL}/dtmf?parent={parent_sid}",
+        method="POST",
+        num_digits=1,
+        timeout=3600,
+        finish_on_key="",
+        action_on_empty_result=False,
+    )
+
     dial = Dial(
         caller_id=TWILIO_NUMBER,
         answer_on_bridge=True,
@@ -93,9 +104,11 @@ async def voice(req: Request):
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
-        # ← NO url= here at all
     ))
-    response.append(dial)
+
+    gather.append(dial)
+    response.append(gather)
+
     return Response(content=str(response), media_type="text/xml")
 
 @app.post("/child-twiml")
@@ -120,24 +133,7 @@ async def child_status(req: Request):
     if parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(call_status)
 
-    # Inject DTMF gather AFTER bridge is live — doesn't interrupt audio
-    if call_status == "in-progress" and child_sid:
-        try:
-            client.calls(child_sid).update(
-                twiml=(
-                    f'<Response>'
-                    f'<Gather input="dtmf" '
-                    f'action="{BASE_URL}/dtmf?parent={parent_sid}" '
-                    f'method="POST" numDigits="1" timeout="3600" finishOnKey="">'
-                    f'</Gather>'
-                    f'<Redirect method="POST">{BASE_URL}/dtmf-loop?parent={parent_sid}&amp;child={child_sid}</Redirect>'
-                    f'</Response>'
-                )
-            )
-            print(f"[child-status] Injected Gather on child {child_sid}")
-        except Exception as e:
-            print(f"[child-status] Failed to inject Gather: {e}")
-
+    # Nothing else — no REST update, no TwiML injection
     return Response(content="", status_code=200)
 
 @app.post("/dtmf-loop")
@@ -167,13 +163,19 @@ async def dtmf(req: Request):
     parent_sid = req.query_params.get("parent", "")
     form = await req.form()
     digit = form.get("Digits", "")
-    print(f"[dtmf] digit={digit} | parent={parent_sid}")
+    call_status = form.get("DialCallStatus", "")  # present if Dial just ended
 
-    if parent_sid and parent_sid in call_status_queues:
+    print(f"[dtmf] digit={digit!r} | dial_status={call_status!r} | parent={parent_sid}")
+
+    # If this fired because Dial ended (no digit), just close out
+    if call_status:
+        return Response(content=str(VoiceResponse()), media_type="text/xml")
+
+    # Real DTMF digit received
+    if digit and parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(f"dtmf:{digit}")
 
-    # Keep listening — re-inject gather
-    child_sid = form.get("CallSid", "")
+    # Keep gathering — re-wrap a new Dial? No — call is still live, just loop Gather
     response = VoiceResponse()
     gather = Gather(
         input="dtmf",
@@ -182,6 +184,7 @@ async def dtmf(req: Request):
         num_digits=1,
         timeout=3600,
         finish_on_key="",
+        action_on_empty_result=False,
     )
     response.append(gather)
     return Response(content=str(response), media_type="text/xml")
