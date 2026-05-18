@@ -91,15 +91,12 @@ async def voice(req: Request):
         action=f"{BASE_URL}/dial-complete",
         method="POST",
     )
-    number = Number(
+    dial.append(Number(
         to,
-        url=f"{BASE_URL}/child-twiml?parent={parent_sid}",
-        method="POST",
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
-    )
-    dial.append(number)
+    ))
     response.append(dial)
     return Response(content=str(response), media_type="text/xml")
 
