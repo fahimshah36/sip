@@ -25,7 +25,7 @@ API_KEY       = os.environ["API_KEY"]
 API_SECRET    = os.environ["API_SECRET"]
 TWIML_APP_SID = os.environ["TWIML_APP_SID"]
 TWILIO_NUMBER = os.environ["TWILIO_NUMBER"]
-BASE_URL      = os.environ["BASE_URL"]  # e.g. https://sip-chc0.onrender.com
+BASE_URL      = os.environ["BASE_URL"]
 
 call_status_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
@@ -52,19 +52,22 @@ async def voice(req: Request):
     to         = form.get("To", "")
     parent_sid = form.get("CallSid", "")
 
-    _ = call_status_queues[parent_sid]  # pre-create queue
+    _ = call_status_queues[parent_sid]
 
     ws_base = BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
 
     response = VoiceResponse()
 
-    # ── <Start><Stream> is NON-BLOCKING — starts stream then immediately
-    #    falls through to <Dial>. Does not affect the call or bridge at all.
+    # <Start><Stream> is non-blocking — falls through to <Dial> immediately.
+    # track="both_tracks" is required to capture DTMF from the callee (outbound track).
     start = Start()
-    start.stream(url=f"{ws_base}/media-stream/{parent_sid}")
+    start.stream(
+        url=f"{ws_base}/media-stream/{parent_sid}",
+        track="both_tracks",
+    )
     response.append(start)
 
-    # ── Dial — completely unchanged ────────────────────────────────────────
+    # Dial — unchanged
     dial = Dial(
         caller_id=TWILIO_NUMBER,
         answer_on_bridge=True,
@@ -82,7 +85,7 @@ async def voice(req: Request):
     return Response(content=str(response), media_type="text/xml")
 
 
-# ── Media Streams WebSocket — DTMF only ───────────────────────────────────────
+# ── Media Streams WebSocket ────────────────────────────────────────────────────
 
 @app.websocket("/media-stream/{call_sid}")
 async def media_stream(websocket: WebSocket, call_sid: str):
