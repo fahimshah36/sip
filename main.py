@@ -90,12 +90,15 @@ async def voice(req: Request):
         answer_on_bridge=True,
         action=f"{BASE_URL}/dial-complete",
         method="POST",
+        record="do-not-record",
     )
     dial.append(Number(
         to,
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
+        url=f"{BASE_URL}/child-twiml?parent={parent_sid}",
+        method="POST",
     ))
     response.append(dial)
     return Response(content=str(response), media_type="text/xml")
@@ -103,15 +106,15 @@ async def voice(req: Request):
 @app.post("/child-twiml")
 async def child_twiml(req: Request):
     parent_sid = req.query_params.get("parent", "")
-    print(f"[child-twiml] parent: {parent_sid}")
     response = VoiceResponse()
     gather = Gather(
         input="dtmf",
         action=f"{BASE_URL}/dtmf?parent={parent_sid}",
         method="POST",
         num_digits=1,
-        timeout=60,
+        timeout=0,          # ← 0 means don't wait, just listen
         finish_on_key="",
+        enhanced=True,      # ← detects DTMF without interrupting audio
     )
     response.append(gather)
     return Response(content=str(response), media_type="text/xml")
