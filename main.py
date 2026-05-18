@@ -82,17 +82,6 @@ async def voice(req: Request):
         call_status_queues[parent_sid]
 
     response = VoiceResponse()
-
-    gather = Gather(
-        input="dtmf",
-        action=f"{BASE_URL}/dtmf?parent={parent_sid}",
-        method="POST",
-        num_digits=1,
-        timeout=3600,
-        finish_on_key="",
-        action_on_empty_result=False,
-    )
-
     dial = Dial(
         caller_id=TWILIO_NUMBER,
         answer_on_bridge=True,
@@ -104,17 +93,29 @@ async def voice(req: Request):
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
+        url=f"{BASE_URL}/child-twiml?parent={parent_sid}",
+        method="POST",
     ))
-
-    gather.append(dial)
-    response.append(gather)
-
+    response.append(dial)
     return Response(content=str(response), media_type="text/xml")
 
 @app.post("/child-twiml")
 async def child_twiml(req: Request):
     parent_sid = req.query_params.get("parent", "")
     response = VoiceResponse()
+    # Gather runs on child leg DURING the bridge (answer_on_bridge=True means
+    # bridge starts when child answers, whisper runs concurrently on child leg)
+    gather = Gather(
+        input="dtmf",
+        action=f"{BASE_URL}/dtmf?parent={parent_sid}",
+        method="POST",
+        num_digits=1,
+        timeout=3600,
+        finish_on_key="",
+    )
+    response.append(gather)
+    # After gather completes (digit pressed), loop back to keep listening
+    response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
     return Response(content=str(response), media_type="text/xml")
 
 
@@ -127,32 +128,12 @@ async def child_status(req: Request):
     call_status = form.get("CallStatus", "")
     child_sid   = form.get("CallSid", "")
     parent_sid  = form.get("ParentCallSid", "")
-
     print(f"[child-status] {call_status.upper()} | child: {child_sid} | parent: {parent_sid}")
 
     if parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(call_status)
 
-    # Nothing else — no REST update, no TwiML injection
     return Response(content="", status_code=200)
-
-@app.post("/dtmf-loop")
-async def dtmf_loop(req: Request):
-    parent_sid = req.query_params.get("parent", "")
-    child_sid  = req.query_params.get("child", "")
-    # Re-inject gather so it never stops listening
-    response = VoiceResponse()
-    gather = Gather(
-        input="dtmf",
-        action=f"{BASE_URL}/dtmf?parent={parent_sid}",
-        method="POST",
-        num_digits=1,
-        timeout=3600,
-        finish_on_key="",
-    )
-    response.append(gather)
-    return Response(content=str(response), media_type="text/xml")
-
 
 # ─────────────────────────────
 # DTMF — callee pressed a key, push to browser via SSE
@@ -163,19 +144,12 @@ async def dtmf(req: Request):
     parent_sid = req.query_params.get("parent", "")
     form = await req.form()
     digit = form.get("Digits", "")
-    call_status = form.get("DialCallStatus", "")  # present if Dial just ended
+    print(f"[dtmf] digit={digit!r} | parent={parent_sid}")
 
-    print(f"[dtmf] digit={digit!r} | dial_status={call_status!r} | parent={parent_sid}")
-
-    # If this fired because Dial ended (no digit), just close out
-    if call_status:
-        return Response(content=str(VoiceResponse()), media_type="text/xml")
-
-    # Real DTMF digit received
     if digit and parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(f"dtmf:{digit}")
 
-    # Keep gathering — re-wrap a new Dial? No — call is still live, just loop Gather
+    # Loop back — keep listening for more digits
     response = VoiceResponse()
     gather = Gather(
         input="dtmf",
@@ -184,9 +158,9 @@ async def dtmf(req: Request):
         num_digits=1,
         timeout=3600,
         finish_on_key="",
-        action_on_empty_result=False,
     )
     response.append(gather)
+    response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
     return Response(content=str(response), media_type="text/xml")
 
 
