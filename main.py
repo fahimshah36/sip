@@ -105,11 +105,10 @@ async def child_status(req: Request):
     form = await req.form()
     call_status = form.get("CallStatus", "")
     parent_sid = form.get("ParentCallSid", "")
-
+    print(f"child-status: {call_status} for parent {parent_sid}")  # ← add this
+    
     if parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(call_status)
-
-    return Response(content="", status_code=200)
 
 
 @app.post("/dtmf")
