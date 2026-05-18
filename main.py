@@ -1,7 +1,10 @@
 import os
 import asyncio
 import json
-import audioop
+try:
+    import audioop
+except ImportError:
+    import audioop_lts as audioop
 import struct
 import math
 import base64

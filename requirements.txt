@@ -3,3 +3,4 @@ uvicorn
 gunicorn
 twilio
 python-dotenv
+audioop-lts
