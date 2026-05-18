@@ -58,16 +58,14 @@ async def voice(req: Request):
 
     response = VoiceResponse()
 
-    # <Start><Stream> is non-blocking — falls through to <Dial> immediately.
-    # track="both_tracks" is required to capture DTMF from the callee (outbound track).
     start = Start()
+    # ADD: dtmf="true" tells Twilio to emit dtmf events on the stream
     start.stream(
         url=f"{ws_base}/media-stream/{parent_sid}",
         track="both_tracks",
     )
     response.append(start)
 
-    # Dial — unchanged
     dial = Dial(
         caller_id=TWILIO_NUMBER,
         answer_on_bridge=True,
@@ -90,19 +88,30 @@ async def voice(req: Request):
 @app.websocket("/media-stream/{call_sid}")
 async def media_stream(websocket: WebSocket, call_sid: str):
     await websocket.accept()
+    print(f"[media-stream] connected  call_sid={call_sid}")
     try:
         while True:
             data = await websocket.receive_text()
-            msg  = json.loads(data)
+            msg = json.loads(data)
+            event_type = msg.get("event")
 
-            if msg.get("event") == "dtmf":
-                digit = msg.get("dtmf", {}).get("digit", "")
-                print(f"[dtmf] digit={digit}  call_sid={call_sid}")
-                if digit and call_sid in call_status_queues:
-                    await call_status_queues[call_sid].put(f"dtmf:{digit}")
+            # Log ALL events so you can see what's arriving
+            print(f"[media-stream] event={event_type}  call_sid={call_sid}  raw={data[:200]}")
+
+            if event_type == "dtmf":
+                dtmf_payload = msg.get("dtmf", {})
+                digit = dtmf_payload.get("digit", "")
+                track = dtmf_payload.get("track", "unknown")
+                print(f"[dtmf] digit={digit!r}  track={track}  call_sid={call_sid}")
+
+                if digit:
+                    # Use defaultdict so this always creates the queue
+                    queue = call_status_queues[call_sid]
+                    await queue.put(f"dtmf:{digit}")
+                    print(f"[dtmf] enqueued dtmf:{digit} for {call_sid}")
 
     except WebSocketDisconnect:
-        pass
+        print(f"[media-stream] disconnected  call_sid={call_sid}")
     except Exception as e:
         print(f"[media-stream] error: {e}")
 
