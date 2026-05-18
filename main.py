@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
-from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Gather, Pause
+from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Gather, Pause, Redirect
 from twilio.rest import Client
 
 app = FastAPI()
@@ -104,10 +104,17 @@ async def child_status(req: Request):
     form = await req.form()
     call_status = form.get("CallStatus", "")
     parent_sid = form.get("ParentCallSid", "")
-    print(f"child-status: {call_status} for parent {parent_sid}")  # ← add this
-    
+    child_sid = form.get("CallSid", "")
+    print(f"child-status: {call_status} for parent {parent_sid}")
+
     if parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(call_status)
+
+    # ← When child answers (bridge formed), inject Gather onto child leg
+    if call_status == "in-progress" and child_sid:
+        asyncio.create_task(inject_dtmf_gather(child_sid, parent_sid))
+
+    return Response(content="", status_code=200)
 
 
 @app.post("/dtmf")
@@ -167,6 +174,44 @@ async def call_events(call_sid: str):
 
 @app.post("/dial-complete")
 async def dial_complete(req: Request):
+    form = await req.form()
+    # dial-complete fires when the bridged call ends — nothing to do
+    return Response(content=str(VoiceResponse()), media_type="text/xml")
+
+async def inject_dtmf_gather(child_sid: str, parent_sid: str):
+    """Modify the live child leg to listen for DTMF indefinitely."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    
+    def _update():
+        response = VoiceResponse()
+        gather = Gather(
+            input="dtmf",
+            action=f"{BASE_URL}/dtmf?parent={parent_sid}",
+            method="POST",
+            num_digits=1,
+            timeout=60,        # wait 60s for a digit, then re-gather
+            action_on_empty_result=True,  # re-hit action even with no input
+        )
+        gather.append(Pause(length=3600))
+        response.append(gather)
+        # If gather times out with no digit, loop back
+        response.append(Redirect(f"{BASE_URL}/regather?parent={parent_sid}&child={child_sid}"))
+        
+        client.calls(child_sid).update(twiml=str(response))
+    
+    await loop.run_in_executor(None, _update)
+
+
+@app.post("/regather")
+async def regather(req: Request):
+    """Called when Gather times out — reinject to keep listening."""
+    parent_sid = req.query_params.get("parent", "")
+    child_sid = req.query_params.get("child", "")
+    
+    if child_sid:
+        asyncio.create_task(inject_dtmf_gather(child_sid, parent_sid))
+    
     return Response(content=str(VoiceResponse()), media_type="text/xml")
 
 
