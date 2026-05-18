@@ -76,29 +76,27 @@ async def make_call(req: Request):
 async def voice(req: Request):
     form = await req.form()
     to = form.get("To", "")
-    site_no = form.get("siteNo", "")
     parent_sid = form.get("CallSid", "")
-    print(f"/voice triggered → dialing {to} | parent SID: {parent_sid}")
-    print(f"[WARNING] Requested SiteNo {site_no}")
 
     if parent_sid:
-        call_status_queues[parent_sid]
+        call_status_queues[parent_sid]  # init queue
 
     response = VoiceResponse()
+    
+    # Gather wraps the Dial — captures DTMF from CALLEE via statusCallback
+    # but the real fix is: just Dial cleanly, use child-status for call events
     dial = Dial(
         caller_id=TWILIO_NUMBER,
         answer_on_bridge=True,
         action=f"{BASE_URL}/dial-complete",
         method="POST",
-        record="do-not-record",
     )
     dial.append(Number(
         to,
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
-        url=f"{BASE_URL}/child-twiml?parent={parent_sid}",
-        method="POST",
+        # No url= here
     ))
     response.append(dial)
     return Response(content=str(response), media_type="text/xml")
@@ -107,18 +105,6 @@ async def voice(req: Request):
 async def child_twiml(req: Request):
     parent_sid = req.query_params.get("parent", "")
     response = VoiceResponse()
-    gather = Gather(
-        input="dtmf",
-        action=f"{BASE_URL}/dtmf?parent={parent_sid}",
-        method="POST",
-        num_digits=1,
-        timeout=60,        # ← wait up to 60s for a digit
-        finish_on_key="",
-        enhanced=True,     # ← don't interrupt audio
-    )
-    response.append(gather)
-    # Loop back if no digit pressed after timeout
-    response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
     return Response(content=str(response), media_type="text/xml")
 
 
@@ -131,10 +117,15 @@ async def child_status(req: Request):
     call_status = form.get("CallStatus", "")
     child_sid   = form.get("CallSid", "")
     parent_sid  = form.get("ParentCallSid", "")
-    print(f"[child-status] {call_status.upper()} | child: {child_sid} | parent: {parent_sid}")
 
     if parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(call_status)
+
+    if call_status == "in-progress":
+        # Now inject Gather on the live child call
+        client.calls(child_sid).update(
+            twiml=f'<Response><Gather input="dtmf" action="{BASE_URL}/dtmf?parent={parent_sid}" numDigits="1" timeout="60" enhanced="true" finishOnKey=""/></Response>'
+        )
 
     return Response(content="", status_code=200)
 
