@@ -84,7 +84,7 @@ async def voice(req: Request):
     response = VoiceResponse()
     dial = Dial(
         caller_id=TWILIO_NUMBER,
-        # answer_on_bridge=True,
+        answer_on_bridge=True,          # ✅ caller hears ringing until pickup
         action=f"{BASE_URL}/dial-complete",
         method="POST",
     )
@@ -93,11 +93,20 @@ async def voice(req: Request):
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
-        url=f"{BASE_URL}/child-twiml?parent={parent_sid}",
-        method="POST",
+        # ✅ No url= whisper at all
     ))
     response.append(dial)
     return Response(content=str(response), media_type="text/xml")
+
+async def inject_gather(child_sid: str, parent_sid: str):
+    await asyncio.sleep(1)  # wait for bridge to fully open
+    try:
+        client.calls(child_sid).update(
+            twiml=f'<Response><Gather input="dtmf" action="{BASE_URL}/dtmf?parent={parent_sid}" method="POST" numDigits="1" timeout="3600" finishOnKey=""></Gather></Response>'
+        )
+        print(f"[inject_gather] ✅ Gather injected on child {child_sid}")
+    except Exception as e:
+        print(f"[inject_gather] ❌ Failed: {e}")
 
 @app.post("/child-twiml")
 async def child_twiml(req: Request):
@@ -149,7 +158,7 @@ async def dtmf(req: Request):
     if digit and parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(f"dtmf:{digit}")
 
-    # Loop back — keep listening for more digits
+    # ✅ Keep listening for more digits
     response = VoiceResponse()
     gather = Gather(
         input="dtmf",
@@ -160,7 +169,6 @@ async def dtmf(req: Request):
         finish_on_key="",
     )
     response.append(gather)
-    response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
     return Response(content=str(response), media_type="text/xml")
 
 
