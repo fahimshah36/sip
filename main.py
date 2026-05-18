@@ -84,7 +84,7 @@ async def voice(req: Request):
     response = VoiceResponse()
     dial = Dial(
         caller_id=TWILIO_NUMBER,
-        answer_on_bridge=True,          # ✅ caller hears ringing until pickup
+        answer_on_bridge=True,
         action=f"{BASE_URL}/dial-complete",
         method="POST",
     )
@@ -93,7 +93,8 @@ async def voice(req: Request):
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
-        # ✅ No url= whisper at all
+        url=f"{BASE_URL}/child-twiml?parent={parent_sid}",  # ← back
+        method="POST",
     ))
     response.append(dial)
     return Response(content=str(response), media_type="text/xml")
@@ -112,18 +113,15 @@ async def inject_gather(child_sid: str, parent_sid: str):
 async def child_twiml(req: Request):
     parent_sid = req.query_params.get("parent", "")
     response = VoiceResponse()
-    # Gather runs on child leg DURING the bridge (answer_on_bridge=True means
-    # bridge starts when child answers, whisper runs concurrently on child leg)
     gather = Gather(
         input="dtmf",
         action=f"{BASE_URL}/dtmf?parent={parent_sid}",
         method="POST",
         num_digits=1,
-        timeout=3600,
+        timeout=30,        # ← short timeout, then redirect loops it
         finish_on_key="",
     )
     response.append(gather)
-    # After gather completes (digit pressed), loop back to keep listening
     response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
     return Response(content=str(response), media_type="text/xml")
 
@@ -158,17 +156,17 @@ async def dtmf(req: Request):
     if digit and parent_sid and parent_sid in call_status_queues:
         await call_status_queues[parent_sid].put(f"dtmf:{digit}")
 
-    # ✅ Keep listening for more digits
     response = VoiceResponse()
     gather = Gather(
         input="dtmf",
         action=f"{BASE_URL}/dtmf?parent={parent_sid}",
         method="POST",
         num_digits=1,
-        timeout=3600,
+        timeout=30,
         finish_on_key="",
     )
     response.append(gather)
+    response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
     return Response(content=str(response), media_type="text/xml")
 
 
