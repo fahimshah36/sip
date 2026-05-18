@@ -28,6 +28,7 @@ BASE_URL      = os.environ["BASE_URL"]
 
 client = Client(ACCOUNT_SID, AUTH_TOKEN)
 
+# In-memory queues for real-time push via SSE
 # key = parent CallSid, value = asyncio.Queue of event strings
 call_status_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
@@ -42,33 +43,48 @@ def token():
     )
     voice_grant = VoiceGrant(
         outgoing_application_sid=TWIML_APP_SID,
-        incoming_allow=True,
+        incoming_allow=True
     )
     access_token.add_grant(voice_grant)
     return {"token": access_token.to_jwt()}
 
 
 # ─────────────────────────────
-# VOICE
-# No answer_on_bridge — audio connects immediately when callee picks up.
-# No url= whisper — nothing to interfere with the bridge.
-# Frontend uses SSE in-progress as the live trigger (not SDK accept event).
+# MAKE CALL (kept for reference)
+# ─────────────────────────────
+@app.post("/make-call")
+async def make_call(req: Request):
+    body = await req.json()
+    to = body.get("to")
+    print(f"Calling {to}...")
+    call = client.calls.create(
+        to=to,
+        from_=TWILIO_NUMBER,
+        url=f"{BASE_URL}/voice",
+        status_callback=f"{BASE_URL}/status",
+        status_callback_method="POST",
+        status_callback_event=["initiated", "ringing", "answered", "completed"],
+    )
+    print(f"Call SID: {call.sid}")
+    return {"call_sid": call.sid, "status": call.status}
+
+
+# ─────────────────────────────
+# VOICE — dials the phone + starts DTMF gather loop
 # ─────────────────────────────
 @app.post("/voice")
 async def voice(req: Request):
     form = await req.form()
-    to         = form.get("To", "")
+    to = form.get("To", "")
     parent_sid = form.get("CallSid", "")
 
-    print(f"/voice → dialing {to} | parent: {parent_sid}")
-
-    # Ensure queue exists before any status callbacks arrive
     if parent_sid:
         call_status_queues[parent_sid]
 
     response = VoiceResponse()
     dial = Dial(
         caller_id=TWILIO_NUMBER,
+        answer_on_bridge=True,
         action=f"{BASE_URL}/dial-complete",
         method="POST",
     )
@@ -77,69 +93,22 @@ async def voice(req: Request):
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
+        url=f"{BASE_URL}/child-twiml?parent={parent_sid}",  # ← back
+        method="POST",
     ))
     response.append(dial)
     return Response(content=str(response), media_type="text/xml")
 
+async def inject_gather(child_sid: str, parent_sid: str):
+    await asyncio.sleep(1)  # wait for bridge to fully open
+    try:
+        client.calls(child_sid).update(
+            twiml=f'<Response><Gather input="dtmf" action="{BASE_URL}/dtmf?parent={parent_sid}" method="POST" numDigits="1" timeout="3600" finishOnKey=""></Gather></Response>'
+        )
+        print(f"[inject_gather] ✅ Gather injected on child {child_sid}")
+    except Exception as e:
+        print(f"[inject_gather] ❌ Failed: {e}")
 
-# ─────────────────────────────
-# CHILD STATUS
-# Forwards call lifecycle events to the browser via SSE queue.
-# in-progress  → browser shows "Live" and opens audio
-# completed    → browser ends the call screen
-# ─────────────────────────────
-@app.post("/child-status")
-async def child_status(req: Request):
-    form = await req.form()
-    call_status = form.get("CallStatus", "")
-    child_sid   = form.get("CallSid", "")
-    parent_sid  = form.get("ParentCallSid", "")
-
-    print(f"[child-status] {call_status.upper()} | child: {child_sid} | parent: {parent_sid}")
-
-    if parent_sid and parent_sid in call_status_queues:
-        await call_status_queues[parent_sid].put(call_status)
-
-    return Response(content="", status_code=200)
-
-
-# ─────────────────────────────
-# DTMF
-# Called by Twilio when the callee presses a digit.
-# The digit is pushed to the SSE queue so the browser receives it instantly.
-# A fresh Gather is returned to keep listening for more digits.
-# ─────────────────────────────
-@app.post("/dtmf")
-async def dtmf(req: Request):
-    parent_sid = req.query_params.get("parent", "")
-    form       = await req.form()
-    digit      = form.get("Digits", "")
-
-    print(f"[dtmf] digit={digit!r} | parent={parent_sid}")
-
-    if digit and parent_sid and parent_sid in call_status_queues:
-        await call_status_queues[parent_sid].put(f"dtmf:{digit}")
-
-    # Return a fresh Gather so the callee can press more digits
-    response = VoiceResponse()
-    gather = Gather(
-        input="dtmf",
-        action=f"{BASE_URL}/dtmf?parent={parent_sid}",
-        method="POST",
-        num_digits=1,
-        timeout=3600,
-        finish_on_key="",
-    )
-    response.append(gather)
-    return Response(content=str(response), media_type="text/xml")
-
-
-# ─────────────────────────────
-# CHILD TWIML  (whisper URL — runs on callee leg in parallel with bridge)
-# Returns a Gather so Twilio listens for DTMF on the callee's phone.
-# timeout=30 + redirect loop avoids long-running HTTP connections being
-# killed by the hosting platform (e.g. Render free tier 30s limit).
-# ─────────────────────────────
 @app.post("/child-twiml")
 async def child_twiml(req: Request):
     parent_sid = req.query_params.get("parent", "")
@@ -149,19 +118,60 @@ async def child_twiml(req: Request):
         action=f"{BASE_URL}/dtmf?parent={parent_sid}",
         method="POST",
         num_digits=1,
-        timeout=25,         # short enough to stay under Render's 30s limit
+        timeout=30,        # ← short timeout, then redirect loops it
         finish_on_key="",
     )
     response.append(gather)
-    # Loop back whether or not a digit was pressed
-    response.redirect(
-        f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST"
-    )
+    response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
     return Response(content=str(response), media_type="text/xml")
 
 
 # ─────────────────────────────
-# SSE  — browser subscribes to real-time call events + DTMF digits
+# CHILD CALL STATUS — phone leg events
+# ─────────────────────────────
+@app.post("/child-status")
+async def child_status(req: Request):
+    form = await req.form()
+    call_status = form.get("CallStatus", "")
+    child_sid   = form.get("CallSid", "")
+    parent_sid  = form.get("ParentCallSid", "")
+    print(f"[child-status] {call_status.upper()} | child: {child_sid} | parent: {parent_sid}")
+
+    if parent_sid and parent_sid in call_status_queues:
+        await call_status_queues[parent_sid].put(call_status)
+
+    return Response(content="", status_code=200)
+
+# ─────────────────────────────
+# DTMF — callee pressed a key, push to browser via SSE
+# then loop back to gather more digits
+# ─────────────────────────────
+@app.post("/dtmf")
+async def dtmf(req: Request):
+    parent_sid = req.query_params.get("parent", "")
+    form = await req.form()
+    digit = form.get("Digits", "")
+    print(f"[dtmf] digit={digit!r} | parent={parent_sid}")
+
+    if digit and parent_sid and parent_sid in call_status_queues:
+        await call_status_queues[parent_sid].put(f"dtmf:{digit}")
+
+    response = VoiceResponse()
+    gather = Gather(
+        input="dtmf",
+        action=f"{BASE_URL}/dtmf?parent={parent_sid}",
+        method="POST",
+        num_digits=1,
+        timeout=30,
+        finish_on_key="",
+    )
+    response.append(gather)
+    response.redirect(f"{BASE_URL}/child-twiml?parent={parent_sid}", method="POST")
+    return Response(content=str(response), media_type="text/xml")
+
+
+# ─────────────────────────────
+# SSE — browser subscribes to real-time call events + DTMF
 # ─────────────────────────────
 @app.get("/call-events/{call_sid}")
 async def call_events(call_sid: str):
@@ -186,7 +196,7 @@ async def call_events(call_sid: str):
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-        },
+        }
     )
 
 
@@ -195,33 +205,18 @@ async def call_events(call_sid: str):
 # ─────────────────────────────
 @app.post("/dial-complete")
 async def dial_complete(req: Request):
-    form        = await req.form()
+    form = await req.form()
     dial_status = form.get("DialCallStatus", "")
-    parent_sid  = form.get("CallSid", "")
-    print(f"/dial-complete → DialCallStatus: {dial_status} | parent: {parent_sid}")
-
-    # Push terminal event so SSE stream closes cleanly
-    if parent_sid and parent_sid in call_status_queues:
-        status_map = {
-            "completed": "completed",
-            "busy":      "busy",
-            "no-answer": "no-answer",
-            "failed":    "failed",
-            "canceled":  "canceled",
-        }
-        mapped = status_map.get(dial_status)
-        if mapped:
-            await call_status_queues[parent_sid].put(mapped)
-
+    print(f"/dial-complete → DialCallStatus: {dial_status}")
     return Response(content=str(VoiceResponse()), media_type="text/xml")
 
 
 # ─────────────────────────────
-# PARENT CALL STATUS (fallback)
+# PARENT CALL STATUS
 # ─────────────────────────────
 @app.post("/status")
 async def status(req: Request):
-    form        = await req.form()
+    form = await req.form()
     call_status = form.get("CallStatus", "")
     call_sid    = form.get("CallSid", "")
     duration    = form.get("CallDuration", "0")
