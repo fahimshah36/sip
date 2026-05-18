@@ -72,8 +72,7 @@ async def voice(req: Request):
     )
     number = Number(
         to,
-        url=f"{BASE_URL}/child-twiml?parent={parent_sid}",
-        method="POST",
+        # ← REMOVE the url= entirely. It was holding the bridge hostage.
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
