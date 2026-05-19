@@ -104,7 +104,7 @@ async def _do_cleanup(call_sid: str) -> None:
     await asyncio.sleep(QUEUE_TTL)
     call_status_queues.pop(call_sid, None)
     _cleanup_tasks.pop(call_sid, None)
-logger.info(f"[cleanup] removed state for parent={call_sid}")
+    logger.info(f"[cleanup] removed state for parent={call_sid}")
 
 
 def _schedule_cleanup(call_sid: str) -> None:
@@ -484,7 +484,6 @@ async def dial_complete(req: Request):
 @app.get("/health")
 def health():
     return {
-        "status":           "ok",
-        "active_calls":     len(call_status_queues),
-        "tracked_children": len(child_to_parent),
+        "status":       "ok",
+        "active_calls": len(call_status_queues),
     }
