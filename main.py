@@ -1,7 +1,48 @@
-import os
+"""
+Twilio Voice Backend — FastAPI
+==============================
+
+Architecture
+------------
+Browser (Twilio Voice JS SDK)
+  │
+  │  WebRTC (audio)
+  ▼
+Twilio Edge
+  │
+  ├─► /voice  (TwiML webhook)
+  │     └─ <Start><Stream>  → WebSocket /media-stream/{parent_sid}  (audio monitoring)
+  │     └─ <Dial>
+  │           └─ <Number url="/child-twiml">  ← Gather wraps the child leg
+  │
+  ├─► /child-twiml  (runs on the PSTN side before bridging)
+  │     └─ <Gather input="dtmf" num_digits=1 action="/dtmf-received">
+  │
+  ├─► /dtmf-received  (Twilio fires this when callee presses a digit)
+  │     └─ pushes  "dtmf:5"  into the SSE queue for the browser
+  │     └─ returns another <Gather> to keep listening
+  │
+  ├─► /child-status  (call progress: initiated / ringing / answered / completed)
+  │
+  └─► /call-events/{call_sid}  (SSE — browser subscribes for real-time events)
+
+DTMF flow
+---------
+Callee presses 5
+  → Twilio captures RFC-2833 event (reliable, fully out-of-band)
+  → POST /dtmf-received  {"Digits": "5", "CallSid": "<child_sid>", ...}
+  → Backend looks up parent_sid from child_to_parent map
+  → Pushes  data: dtmf:5  into parent SSE queue
+  → Browser EventSource fires and calls onDtmfDigit("5")
+
+No Goertzel / no Web Audio frequency analysis needed on the frontend.
+"""
+
 import asyncio
+import base64
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -9,13 +50,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
-from twilio.twiml.voice_response import VoiceResponse, Dial, Number, Connect, Stream, Start
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from twilio.twiml.voice_response import Dial, Gather, Number, Start, VoiceResponse
 
 # ---------------------------------------------------------------------------
-# Env
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
+)
+logger = logging.getLogger("voice")
+
+# ---------------------------------------------------------------------------
+# Environment
 # ---------------------------------------------------------------------------
 ACCOUNT_SID   = os.environ["ACCOUNT_SID"]
 AUTH_TOKEN    = os.environ["AUTH_TOKEN"]
@@ -26,43 +73,69 @@ TWILIO_NUMBER = os.environ["TWILIO_NUMBER"]
 BASE_URL      = os.environ["BASE_URL"].rstrip("/")
 
 # ---------------------------------------------------------------------------
-# In-memory state  (replace with Redis for multi-worker deployments)
+# In-memory call state
+# Replace with Redis if running more than one worker process.
+#
+# call_sid (parent leg) → asyncio.Queue[str]
+#   Events pushed:
+#     "initiated"      child leg created
+#     "ringing"        callee phone is ringing
+#     "answered"       callee picked up
+#     "completed"      call ended normally
+#     "failed" etc.    other terminal states
+#     "dtmf:<digit>"   callee pressed a key  e.g. "dtmf:5"
+#
+# child_to_parent: child call SID → parent call SID
 # ---------------------------------------------------------------------------
-# call_sid → asyncio.Queue[str]  (call status events)
 call_status_queues: dict[str, asyncio.Queue] = {}
-# call_sid → asyncio.Task (background cleanup)
-_cleanup_tasks: dict[str, asyncio.Task] = {}
+child_to_parent:   dict[str, str]            = {}
+_cleanup_tasks:    dict[str, asyncio.Task]   = {}
 
-QUEUE_TTL = 300  # seconds to keep a queue after the call ends
+QUEUE_TTL       = 300   # seconds to keep state after a call ends
+TERMINAL_STATES = {"completed", "failed", "busy", "no-answer", "canceled"}
 
 
 def _get_or_create_queue(call_sid: str) -> asyncio.Queue:
     if call_sid not in call_status_queues:
-        call_status_queues[call_sid] = asyncio.Queue(maxsize=50)
+        call_status_queues[call_sid] = asyncio.Queue(maxsize=100)
     return call_status_queues[call_sid]
 
 
-async def _schedule_cleanup(call_sid: str):
-    """Remove the queue after TTL so we don't leak memory."""
+async def _do_cleanup(call_sid: str) -> None:
     await asyncio.sleep(QUEUE_TTL)
     call_status_queues.pop(call_sid, None)
     _cleanup_tasks.pop(call_sid, None)
-    logger.info(f"[cleanup] removed queue for {call_sid}")
+    stale = [c for c, p in child_to_parent.items() if p == call_sid]
+    for c in stale:
+        child_to_parent.pop(c, None)
+    logger.info(f"[cleanup] removed state for parent={call_sid}")
 
 
-def _trigger_cleanup(call_sid: str):
+def _schedule_cleanup(call_sid: str) -> None:
     if call_sid not in _cleanup_tasks:
-        _cleanup_tasks[call_sid] = asyncio.create_task(_schedule_cleanup(call_sid))
+        _cleanup_tasks[call_sid] = asyncio.create_task(_do_cleanup(call_sid))
+
+
+def _push_event(parent_sid: str, event: str) -> None:
+    """Non-blocking push into the parent SSE queue. Silently drops if full."""
+    if not parent_sid:
+        return
+    q = _get_or_create_queue(parent_sid)
+    try:
+        q.put_nowait(event)
+    except asyncio.QueueFull:
+        logger.warning(
+            f"[queue] full — dropped event={event!r} parent={parent_sid}"
+        )
 
 
 # ---------------------------------------------------------------------------
-# App
+# App lifecycle
 # ---------------------------------------------------------------------------
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     yield
-    # Cancel any pending cleanup tasks on shutdown
-    for task in _cleanup_tasks.values():
+    for task in list(_cleanup_tasks.values()):
         task.cancel()
 
 
@@ -77,39 +150,49 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Token
+# GET /token
+# Returns a short-lived Twilio Access Token for the browser JS SDK.
 # ---------------------------------------------------------------------------
 @app.get("/token")
-def token():
-    access_token = AccessToken(
-        ACCOUNT_SID, API_KEY, API_SECRET, identity="visitor", ttl=3600
+def get_token():
+    at = AccessToken(
+        ACCOUNT_SID, API_KEY, API_SECRET,
+        identity="visitor",
+        ttl=3600,
     )
-    access_token.add_grant(VoiceGrant(
+    at.add_grant(VoiceGrant(
         outgoing_application_sid=TWIML_APP_SID,
         incoming_allow=True,
     ))
-    return {"token": access_token.to_jwt()}
+    return {"token": at.to_jwt()}
 
 
 # ---------------------------------------------------------------------------
-# /voice  – the TwiML webhook Twilio calls when a call is initiated
+# POST /voice
+# Twilio calls this when the browser initiates an outbound call via the SDK.
 #
-# FIX: Move <Start><Stream> AFTER <Dial> is set up, and use a <Connect><Stream>
-# pattern OR attach the stream only after the bridge is live.
+# TwiML produced:
 #
-# The safest pattern for browser → PSTN calls where you want to monitor audio
-# without breaking the voice bridge is:
-#   1. <Dial answerOnBridge="true"> with <Number> — this establishes the bridge
-#   2. Use the statusCallback on <Number> to know when the call is answered,
-#      then start the stream via the REST API (Streams resource) separately.
+#   <Response>
+#     <Start>
+#       <Stream name="monitor" url="wss://…/media-stream/{parent_sid}"
+#               track="both_tracks"/>
+#     </Start>
+#     <Dial callerId="…" answerOnBridge="false" action="/dial-complete"
+#           timeout="30" timeLimit="14400">
+#       <Number url="/child-twiml" statusCallback="/child-status"
+#               statusCallbackEvent="initiated ringing answered completed">
+#         +15551234567
+#       </Number>
+#     </Dial>
+#   </Response>
 #
-# However, if you only need passive monitoring (no audio injection), the
-# approach below is the minimal-impact fix:  keep <Start><Stream> but move it
-# INSIDE the dial action response, or simply accept that the stream starts at
-# dial-time and ensure the WS handler is non-blocking.
-#
-# The CRITICAL fix for audio quality is removing answer_on_bridge interference
-# with the early stream, and making the WS consumer fast and non-blocking.
+# Key decisions
+# -------------
+# • answer_on_bridge=False  avoids early-media race with <Start><Stream>.
+# • <Number url="/child-twiml">  tells Twilio to run /child-twiml on the
+#   PSTN leg after the callee answers but before bridging.  That is where
+#   <Gather> lives so DTMF comes in via webhook, not in-band audio.
 # ---------------------------------------------------------------------------
 @app.post("/voice")
 async def voice(req: Request):
@@ -119,149 +202,129 @@ async def voice(req: Request):
 
     _get_or_create_queue(parent_sid)
 
-    ws_base = BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
+    ws_base = (
+        BASE_URL
+        .replace("https://", "wss://")
+        .replace("http://",  "ws://")
+    )
 
     response = VoiceResponse()
 
-    # -----------------------------------------------------------------------
-    # FIX 1: Start the stream with a name so it can be stopped later.
-    # FIX 2: The stream starts here (before dial connects), which is fine for
-    # monitoring — but we must ensure the WS handler is fast (see below).
-    # FIX 3: Do NOT set answer_on_bridge=True when using <Start><Stream> before
-    # <Dial>, as this creates a timing race where Twilio may not have fully
-    # set up the bridge when the media stream starts.
-    # -----------------------------------------------------------------------
+    # ── Audio monitoring (unidirectional, both sides) ────────────────────────
     start = Start()
     start.stream(
-        name="live-monitor",
+        name="monitor",
         url=f"{ws_base}/media-stream/{parent_sid}",
         track="both_tracks",
     )
     response.append(start)
 
+    # ── Outbound PSTN dial ───────────────────────────────────────────────────
     dial = Dial(
         caller_id=TWILIO_NUMBER,
-        # FIX 4: Set answer_on_bridge=False (default) when stream starts before
-        # Dial. answer_on_bridge=True is great for UX but when combined with a
-        # pre-dial stream it can cause one-way audio on some carriers because
-        # the early-media path conflicts with the stream fork timing.
-        # If you want the ringing UX, start the stream in /dial-complete instead.
         answer_on_bridge=False,
         action=f"{BASE_URL}/dial-complete",
         method="POST",
-        timeout=30,        # FIX 5: explicit timeout (default 30s, good to be explicit)
-        time_limit=14400,  # FIX 6: 4-hour hard cap to prevent runaway calls
+        timeout=30,
+        time_limit=14400,
     )
     dial.append(Number(
         to,
+        url=f"{BASE_URL}/child-twiml",          # DTMF <Gather> runs here
+        method="POST",
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
     ))
     response.append(dial)
 
-    logger.info(f"[voice] outbound call parent={parent_sid} to={to}")
+    logger.info(f"[voice] new call  parent={parent_sid}  to={to}")
     return Response(content=str(response), media_type="text/xml")
 
 
 # ---------------------------------------------------------------------------
-# /media-stream/{call_sid}  –  WebSocket handler
+# POST /child-twiml
+# Runs on the PSTN (callee) leg immediately after they answer,
+# before Twilio bridges audio to the browser.
 #
-# FIX: The original handler blocked on receive_text() in a tight loop and
-# discarded everything. This is fine functionally but can cause backpressure
-# if the event loop is busy, delaying ACKs and causing Twilio to perceive the
-# WebSocket as slow, which can stall the audio pipeline.
-#
-# Improvements:
-#  • Use asyncio.Queue as a decoupled producer/consumer
-#  • Send WebSocket pings to keep the connection alive on long calls
-#  • Log stream start/stop events for observability
+# We place a <Gather> here with num_digits=1 and action=/dtmf-received.
+# Every single keypress fires a webhook — no in-band frequency analysis.
+# Twilio passes ParentCallSid so we know which browser to notify.
 # ---------------------------------------------------------------------------
-@app.websocket("/media-stream/{call_sid}")
-async def media_stream(websocket: WebSocket, call_sid: str):
-    await websocket.accept()
-    logger.info(f"[media-stream] connected  call_sid={call_sid}")
+@app.post("/child-twiml")
+async def child_twiml(req: Request):
+    form       = await req.form()
+    child_sid  = form.get("CallSid", "")
+    parent_sid = form.get("ParentCallSid", "")
 
-    # Internal queue so the receive loop is never blocked by processing
-    audio_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=200)
-    stream_sid: str | None = None
+    if child_sid and parent_sid:
+        child_to_parent[child_sid] = parent_sid
+        logger.info(f"[child-twiml] child={child_sid}  parent={parent_sid}")
 
-    async def receiver():
-        """Read from WebSocket as fast as possible — never block here."""
-        nonlocal stream_sid
-        try:
-            while True:
-                raw  = await websocket.receive_text()
-                msg  = json.loads(raw)
-                event = msg.get("event", "")
+    response = VoiceResponse()
 
-                if event == "start":
-                    stream_sid = msg.get("start", {}).get("streamSid")
-                    logger.info(f"[media-stream] stream started  streamSid={stream_sid}  call_sid={call_sid}")
+    # num_digits=1  → fires the action URL after every single keypress
+    # finish_on_key=""  → no key terminates the gather early
+    # timeout=3600   → keep listening for the whole call duration
+    gather = Gather(
+        input="dtmf",
+        action=f"{BASE_URL}/dtmf-received",
+        method="POST",
+        num_digits=1,
+        finish_on_key="",
+        timeout=3600,
+    )
+    response.append(gather)
 
-                elif event == "stop":
-                    logger.info(f"[media-stream] stream stopped  call_sid={call_sid}")
-                    break
+    # Safety fallback — should never reach here with num_digits=1
+    response.pause(length=1)
 
-                elif event == "media":
-                    # Drop frames if consumer is behind — better to drop than block
-                    if not audio_queue.full():
-                        await audio_queue.put(msg)
-
-                elif event == "connected":
-                    logger.info(f"[media-stream] ws connected  call_sid={call_sid}")
-
-                else:
-                    logger.debug(f"[media-stream] event={event}  call_sid={call_sid}")
-
-        except WebSocketDisconnect:
-            logger.info(f"[media-stream] disconnected  call_sid={call_sid}")
-        except Exception as e:
-            logger.error(f"[media-stream] receiver error: {e}")
-
-    async def processor():
-        """
-        Process audio frames here.  Currently a no-op passthrough — add your
-        STT, recording, or analysis logic here without blocking the receiver.
-        """
-        while True:
-            try:
-                msg = await asyncio.wait_for(audio_queue.get(), timeout=5.0)
-                # TODO: forward to STT / recording pipeline
-                # payload = msg["media"]["payload"]  # base64 mulaw audio
-                audio_queue.task_done()
-            except asyncio.TimeoutError:
-                # No audio for 5s — normal during silence or after call ends
-                continue
-            except asyncio.CancelledError:
-                break
-
-    async def keepalive():
-        """
-        FIX: Send periodic pings so the WS isn't closed by load balancers /
-        Twilio's edge on long calls (> 60 s idle).
-        """
-        try:
-            while True:
-                await asyncio.sleep(20)
-                await websocket.send_text(json.dumps({"event": "ping"}))
-        except Exception:
-            pass  # WS is already closed
-
-    recv_task      = asyncio.create_task(receiver())
-    process_task   = asyncio.create_task(processor())
-    keepalive_task = asyncio.create_task(keepalive())
-
-    try:
-        await recv_task  # wait until the receiver finishes
-    finally:
-        process_task.cancel()
-        keepalive_task.cancel()
-        logger.info(f"[media-stream] all tasks finished  call_sid={call_sid}")
+    return Response(content=str(response), media_type="text/xml")
 
 
 # ---------------------------------------------------------------------------
-# /child-status  –  status webhook for the outbound leg
+# POST /dtmf-received
+# Twilio fires this every time the callee presses a digit.
+#
+# We push "dtmf:<digit>" into the parent SSE queue, then return another
+# <Gather> so Twilio keeps listening for further keypresses.
+# ---------------------------------------------------------------------------
+@app.post("/dtmf-received")
+async def dtmf_received(req: Request):
+    form      = await req.form()
+    digits    = form.get("Digits", "")
+    child_sid = form.get("CallSid", "")
+
+    parent_sid = child_to_parent.get(child_sid)
+
+    logger.info(
+        f"[dtmf] digit={digits!r}  child={child_sid}  parent={parent_sid}"
+    )
+
+    if digits and parent_sid:
+        for digit in digits:        # num_digits=1 so usually one char, but be safe
+            _push_event(parent_sid, f"dtmf:{digit}")
+
+    # Return another <Gather> so the next keypress is also captured
+    response = VoiceResponse()
+    gather = Gather(
+        input="dtmf",
+        action=f"{BASE_URL}/dtmf-received",
+        method="POST",
+        num_digits=1,
+        finish_on_key="",
+        timeout=3600,
+    )
+    response.append(gather)
+    response.pause(length=1)
+
+    return Response(content=str(response), media_type="text/xml")
+
+
+# ---------------------------------------------------------------------------
+# POST /child-status
+# Call-progress webhooks for the PSTN leg.
+# Maps Twilio status names → frontend event names and pushes to SSE queue.
 # ---------------------------------------------------------------------------
 @app.post("/child-status")
 async def child_status(req: Request):
@@ -269,27 +332,143 @@ async def child_status(req: Request):
     call_status = form.get("CallStatus", "")
     parent_sid  = form.get("ParentCallSid", "")
     child_sid   = form.get("CallSid", "")
-    logger.info(f"[child-status] {call_status}  child={child_sid}  parent={parent_sid}")
+
+    logger.info(
+        f"[child-status] status={call_status}"
+        f"  child={child_sid}  parent={parent_sid}"
+    )
+
+    # Normalise Twilio status → frontend event name
+    status_map: dict[str, str] = {
+        "initiated":   "initiated",
+        "ringing":     "ringing",
+        "in-progress": "answered",
+        "completed":   "completed",
+        "failed":      "failed",
+        "busy":        "busy",
+        "no-answer":   "no-answer",
+        "canceled":    "canceled",
+    }
+    event = status_map.get(call_status, call_status)
 
     if parent_sid:
-        queue = _get_or_create_queue(parent_sid)
-        try:
-            queue.put_nowait(call_status)
-        except asyncio.QueueFull:
-            logger.warning(f"[child-status] queue full for {parent_sid}, dropping event")
+        # Backup child→parent registration in case /child-twiml was missed
+        if child_sid and child_sid not in child_to_parent:
+            child_to_parent[child_sid] = parent_sid
 
-        terminal = {"completed", "failed", "busy", "no-answer", "canceled"}
-        if call_status in terminal:
-            _trigger_cleanup(parent_sid)
+        _push_event(parent_sid, event)
+
+        if call_status in TERMINAL_STATES:
+            _schedule_cleanup(parent_sid)
+            child_to_parent.pop(child_sid, None)
 
     return Response(content="", status_code=200)
 
 
 # ---------------------------------------------------------------------------
-# /call-events/{call_sid}  –  SSE endpoint the browser polls for status
+# WebSocket /media-stream/{call_sid}
+# Receives the forked audio stream from <Start><Stream>.
+# DTMF is NOT detected here — it comes via /dtmf-received above.
+# This handler is for audio monitoring / STT / recording pipelines.
 # ---------------------------------------------------------------------------
-TERMINAL_STATUSES = {"completed", "failed", "busy", "no-answer", "canceled"}
+@app.websocket("/media-stream/{call_sid}")
+async def media_stream(websocket: WebSocket, call_sid: str):
+    await websocket.accept()
+    logger.info(f"[ws] connected  call_sid={call_sid}")
 
+    # Internal queue decouples the fast receiver from the slower processor.
+    # If the processor falls behind, frames are dropped (not blocked).
+    audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
+    stream_sid:  str | None           = None
+
+    async def receiver() -> None:
+        nonlocal stream_sid
+        try:
+            while True:
+                raw   = await websocket.receive_text()
+                msg   = json.loads(raw)
+                event = msg.get("event", "")
+
+                if event == "connected":
+                    logger.info(f"[ws] handshake OK  call_sid={call_sid}")
+
+                elif event == "start":
+                    meta       = msg.get("start", {})
+                    stream_sid = meta.get("streamSid")
+                    logger.info(
+                        f"[ws] stream started  sid={stream_sid}"
+                        f"  tracks={meta.get('tracks')}  call={call_sid}"
+                    )
+
+                elif event == "media":
+                    payload = msg.get("media", {}).get("payload", "")
+                    if payload and not audio_queue.full():
+                        # 8 kHz µ-law PCM, base64-encoded
+                        audio_queue.put_nowait(base64.b64decode(payload))
+
+                elif event == "stop":
+                    logger.info(f"[ws] stream stopped  call_sid={call_sid}")
+                    break
+
+                # <Start><Stream> never sends dtmf events — those come via
+                # the /dtmf-received webhook.
+
+        except WebSocketDisconnect:
+            logger.info(f"[ws] client disconnected  call_sid={call_sid}")
+        except Exception as exc:
+            logger.error(f"[ws] receiver error: {exc}")
+
+    async def processor() -> None:
+        """
+        Consume µ-law audio frames without blocking the receiver loop.
+        Plug your STT / recording / analysis logic in here.
+        """
+        while True:
+            try:
+                _chunk = await asyncio.wait_for(audio_queue.get(), timeout=10.0)
+                # TODO: forward _chunk to Deepgram / Whisper / S3 / etc.
+                audio_queue.task_done()
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+    async def keepalive() -> None:
+        """Ping Twilio every 20 s to prevent load-balancer idle timeout."""
+        try:
+            while True:
+                await asyncio.sleep(20)
+                await websocket.send_text(json.dumps({"event": "ping"}))
+        except Exception:
+            pass  # socket already closed
+
+    recv_task      = asyncio.create_task(receiver())
+    process_task   = asyncio.create_task(processor())
+    keepalive_task = asyncio.create_task(keepalive())
+
+    try:
+        await recv_task
+    finally:
+        process_task.cancel()
+        keepalive_task.cancel()
+        logger.info(f"[ws] all tasks done  call_sid={call_sid}")
+
+
+# ---------------------------------------------------------------------------
+# GET /call-events/{call_sid}
+# Server-Sent Events — the browser subscribes here to get real-time updates.
+#
+# Event payload (text after "data: "):
+#   "initiated"    child leg created
+#   "ringing"      callee phone ringing
+#   "answered"     callee picked up
+#   "completed"    call ended
+#   "busy"         line busy
+#   "no-answer"    callee didn't pick up
+#   "failed"       call failed
+#   "canceled"     caller hung up before answer
+#   "dtmf:5"       callee pressed digit 5  ← this is what your hook reads
+# ---------------------------------------------------------------------------
 @app.get("/call-events/{call_sid}")
 async def call_events(call_sid: str):
     queue = _get_or_create_queue(call_sid)
@@ -300,10 +479,10 @@ async def call_events(call_sid: str):
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=25)
                     yield f"data: {event}\n\n"
-                    if event in TERMINAL_STATUSES:
+                    if event in TERMINAL_STATES:
                         break
                 except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
+                    yield ": keepalive\n\n"   # SSE comment line — browser ignores
         except asyncio.CancelledError:
             pass
 
@@ -311,41 +490,39 @@ async def call_events(call_sid: str):
         stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",   # FIX: explicit keep-alive for SSE
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",      # disable nginx response buffering
+            "Connection":       "keep-alive",
         },
     )
 
 
 # ---------------------------------------------------------------------------
-# /dial-complete  –  called when the <Dial> leg ends
+# POST /dial-complete
+# Twilio calls this when the <Dial> verb finishes (either side hung up).
 # ---------------------------------------------------------------------------
 @app.post("/dial-complete")
 async def dial_complete(req: Request):
     form       = await req.form()
     parent_sid = form.get("CallSid", "")
     status     = form.get("DialCallStatus", "")
-    logger.info(f"[dial-complete] DialCallStatus={status}  parent={parent_sid}")
 
-    if parent_sid and status in TERMINAL_STATUSES:
-        queue = _get_or_create_queue(parent_sid)
-        try:
-            queue.put_nowait(status)
-        except asyncio.QueueFull:
-            pass
-        _trigger_cleanup(parent_sid)
+    logger.info(f"[dial-complete] status={status}  parent={parent_sid}")
 
-    # Return empty TwiML — call ends cleanly
+    if parent_sid and status in TERMINAL_STATES:
+        _push_event(parent_sid, status)
+        _schedule_cleanup(parent_sid)
+
     return Response(content=str(VoiceResponse()), media_type="text/xml")
 
 
 # ---------------------------------------------------------------------------
-# /health
+# GET /health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "active_calls": len(call_status_queues),
+        "status":           "ok",
+        "active_calls":     len(call_status_queues),
+        "tracked_children": len(child_to_parent),
     }
