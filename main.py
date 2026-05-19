@@ -88,7 +88,6 @@ BASE_URL      = os.environ["BASE_URL"].rstrip("/")
 # child_to_parent: child call SID → parent call SID
 # ---------------------------------------------------------------------------
 call_status_queues: dict[str, asyncio.Queue] = {}
-child_to_parent:   dict[str, str]            = {}
 _cleanup_tasks:    dict[str, asyncio.Task]   = {}
 
 QUEUE_TTL       = 300   # seconds to keep state after a call ends
@@ -105,10 +104,7 @@ async def _do_cleanup(call_sid: str) -> None:
     await asyncio.sleep(QUEUE_TTL)
     call_status_queues.pop(call_sid, None)
     _cleanup_tasks.pop(call_sid, None)
-    stale = [c for c, p in child_to_parent.items() if p == call_sid]
-    for c in stale:
-        child_to_parent.pop(c, None)
-    logger.info(f"[cleanup] removed state for parent={call_sid}")
+logger.info(f"[cleanup] removed state for parent={call_sid}")
 
 
 def _schedule_cleanup(call_sid: str) -> None:
@@ -219,10 +215,24 @@ async def voice(req: Request):
     )
     response.append(start)
 
-    # ── Outbound PSTN dial ───────────────────────────────────────────────────
+    # ── DTMF capture via <Gather> wrapping <Dial> ────────────────────────────
+    # Twilio supports <Gather> around <Dial>: the call bridges normally AND
+    # any digit pressed by either party fires the action webhook.
+    # num_digits=1 + action → fires /dtmf-received on every single keypress.
+    # finish_on_key="" → no key ends the gather prematurely.
+    # The <Dial> inside is what actually establishes the PSTN bridge.
+    gather = Gather(
+        input="dtmf",
+        action=f"{BASE_URL}/dtmf-received",
+        method="POST",
+        num_digits=1,
+        finish_on_key="",
+        timeout=14400,              # keep gathering for whole call duration
+    )
+
     dial = Dial(
         caller_id=TWILIO_NUMBER,
-        answer_on_bridge=False,
+        answer_on_bridge=True,      # caller hears ringing until callee picks up
         action=f"{BASE_URL}/dial-complete",
         method="POST",
         timeout=30,
@@ -230,56 +240,17 @@ async def voice(req: Request):
     )
     dial.append(Number(
         to,
-        url=f"{BASE_URL}/child-twiml",          # DTMF <Gather> runs here
-        method="POST",
         status_callback=f"{BASE_URL}/child-status",
         status_callback_method="POST",
         status_callback_event="initiated ringing answered completed",
     ))
-    response.append(dial)
+    gather.append(dial)
+    response.append(gather)
 
     logger.info(f"[voice] new call  parent={parent_sid}  to={to}")
     return Response(content=str(response), media_type="text/xml")
 
 
-# ---------------------------------------------------------------------------
-# POST /child-twiml
-# Runs on the PSTN (callee) leg immediately after they answer,
-# before Twilio bridges audio to the browser.
-#
-# We place a <Gather> here with num_digits=1 and action=/dtmf-received.
-# Every single keypress fires a webhook — no in-band frequency analysis.
-# Twilio passes ParentCallSid so we know which browser to notify.
-# ---------------------------------------------------------------------------
-@app.post("/child-twiml")
-async def child_twiml(req: Request):
-    form       = await req.form()
-    child_sid  = form.get("CallSid", "")
-    parent_sid = form.get("ParentCallSid", "")
-
-    if child_sid and parent_sid:
-        child_to_parent[child_sid] = parent_sid
-        logger.info(f"[child-twiml] child={child_sid}  parent={parent_sid}")
-
-    response = VoiceResponse()
-
-    # num_digits=1  → fires the action URL after every single keypress
-    # finish_on_key=""  → no key terminates the gather early
-    # timeout=3600   → keep listening for the whole call duration
-    gather = Gather(
-        input="dtmf",
-        action=f"{BASE_URL}/dtmf-received",
-        method="POST",
-        num_digits=1,
-        finish_on_key="",
-        timeout=3600,
-    )
-    response.append(gather)
-
-    # Safety fallback — should never reach here with num_digits=1
-    response.pause(length=1)
-
-    return Response(content=str(response), media_type="text/xml")
 
 
 # ---------------------------------------------------------------------------
@@ -291,21 +262,18 @@ async def child_twiml(req: Request):
 # ---------------------------------------------------------------------------
 @app.post("/dtmf-received")
 async def dtmf_received(req: Request):
-    form      = await req.form()
-    digits    = form.get("Digits", "")
-    child_sid = form.get("CallSid", "")
+    form       = await req.form()
+    digits     = form.get("Digits", "")
+    # <Gather> is on the parent leg so CallSid IS the parent SID directly
+    parent_sid = form.get("CallSid", "")
 
-    parent_sid = child_to_parent.get(child_sid)
-
-    logger.info(
-        f"[dtmf] digit={digits!r}  child={child_sid}  parent={parent_sid}"
-    )
+    logger.info(f"[dtmf] digit={digits!r}  parent={parent_sid}")
 
     if digits and parent_sid:
-        for digit in digits:        # num_digits=1 so usually one char, but be safe
+        for digit in digits:
             _push_event(parent_sid, f"dtmf:{digit}")
 
-    # Return another <Gather> so the next keypress is also captured
+    # Empty <Gather> keeps Twilio listening — the existing bridge stays alive
     response = VoiceResponse()
     gather = Gather(
         input="dtmf",
@@ -313,10 +281,9 @@ async def dtmf_received(req: Request):
         method="POST",
         num_digits=1,
         finish_on_key="",
-        timeout=3600,
+        timeout=14400,
     )
     response.append(gather)
-    response.pause(length=1)
 
     return Response(content=str(response), media_type="text/xml")
 
@@ -352,15 +319,10 @@ async def child_status(req: Request):
     event = status_map.get(call_status, call_status)
 
     if parent_sid:
-        # Backup child→parent registration in case /child-twiml was missed
-        if child_sid and child_sid not in child_to_parent:
-            child_to_parent[child_sid] = parent_sid
-
         _push_event(parent_sid, event)
 
         if call_status in TERMINAL_STATES:
             _schedule_cleanup(parent_sid)
-            child_to_parent.pop(child_sid, None)
 
     return Response(content="", status_code=200)
 
